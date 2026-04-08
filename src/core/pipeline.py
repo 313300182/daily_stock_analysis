@@ -340,6 +340,18 @@ class StockAnalysisPipeline:
             except Exception as e:
                 logger.debug(f"{stock_name}({code}) 基本面快照写入失败: {e}")
 
+            # Step 2.6: 商品价格上下文（资源类股票增强，非资源股零开销）
+            commodity_context: Optional[Dict[str, Any]] = None
+            try:
+                commodity_context = self.fetcher_manager.get_commodity_context(code, stock_name)
+                if commodity_context:
+                    logger.info(
+                        f"{stock_name}({code}) 关联商品: "
+                        f"{[c['name'] for c in commodity_context.get('related_commodities', [])]}"
+                    )
+            except Exception as e:
+                logger.debug(f"{stock_name}({code}) 商品价格上下文获取失败: {e}")
+
             # Step 3: 趋势分析（基于交易理念）— 在 Agent 分支之前执行，供两条路径共用
             trend_result: Optional[TrendAnalysisResult] = None
             try:
@@ -370,6 +382,7 @@ class StockAnalysisPipeline:
                     chip_data,
                     fundamental_context,
                     trend_result,
+                    commodity_context=commodity_context,
                 )
 
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
@@ -449,8 +462,9 @@ class StockAnalysisPipeline:
                 realtime_quote, 
                 chip_data,
                 trend_result,
-                stock_name,  # 传入股票名称
+                stock_name,
                 fundamental_context,
+                commodity_context,
             )
             
             # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
@@ -517,7 +531,135 @@ class StockAnalysisPipeline:
             logger.error(f"{stock_name}({code}) 分析失败: {e}")
             logger.exception(f"{stock_name}({code}) 详细错误信息:")
             return None
-    
+
+    def export_stock_prompt(
+        self,
+        code: str,
+        output_dir: str,
+        report_type: ReportType = ReportType.SIMPLE,
+        query_id: str = "",
+        current_time: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """
+        走完数据采集流程，组装完整 prompt 后导出到文件（不调用 LLM）。
+
+        Returns:
+            导出文件的路径，失败时返回 None
+        """
+        import os
+        stock_name = code
+        try:
+            stock_name = self.fetcher_manager.get_stock_name(code, allow_realtime=False)
+
+            success, error = self.fetch_and_save_stock_data(
+                code, current_time=current_time
+            )
+            if not success:
+                logger.warning(f"[{code}] 数据获取失败: {error}，尝试用已有数据组装 prompt")
+
+            realtime_quote = None
+            try:
+                if self.config.enable_realtime_quote:
+                    realtime_quote = self.fetcher_manager.get_realtime_quote(code, log_final_failure=False)
+                    if realtime_quote and realtime_quote.name:
+                        stock_name = realtime_quote.name
+            except Exception as e:
+                logger.warning(f"{stock_name}({code}) 实时行情获取失败: {e}")
+
+            if not stock_name:
+                stock_name = f'股票{code}'
+
+            chip_data = None
+            try:
+                chip_data = self.fetcher_manager.get_chip_distribution(code)
+            except Exception as e:
+                logger.warning(f"{stock_name}({code}) 获取筹码分布失败: {e}")
+
+            fundamental_context = None
+            try:
+                fundamental_context = self.fetcher_manager.get_fundamental_context(
+                    code,
+                    budget_seconds=getattr(self.config, 'fundamental_stage_timeout_seconds', 1.5),
+                )
+            except Exception as e:
+                fundamental_context = self.fetcher_manager.build_failed_fundamental_context(code, str(e))
+            fundamental_context = self._attach_belong_boards_to_fundamental_context(code, fundamental_context)
+
+            commodity_context = None
+            try:
+                commodity_context = self.fetcher_manager.get_commodity_context(code, stock_name)
+            except Exception:
+                pass
+
+            trend_result = None
+            try:
+                _mkt = get_market_for_stock(normalize_stock_code(code))
+                end_date = get_market_now(_mkt).date()
+                start_date = end_date - timedelta(days=89)
+                historical_bars = self.db.get_data_range(code, start_date, end_date)
+                if historical_bars:
+                    df = pd.DataFrame([bar.to_dict() for bar in historical_bars])
+                    if self.config.enable_realtime_quote and realtime_quote:
+                        df = self._augment_historical_with_realtime(df, realtime_quote, code)
+                    trend_result = self.trend_analyzer.analyze(df, code)
+            except Exception as e:
+                logger.warning(f"{stock_name}({code}) 趋势分析失败: {e}")
+
+            news_context = None
+            if self.search_service is not None and self.search_service.is_available:
+                try:
+                    intel_results = self.search_service.search_comprehensive_intel(
+                        stock_code=code, stock_name=stock_name, max_searches=5
+                    )
+                    if intel_results:
+                        news_context = self.search_service.format_intel_report(intel_results, stock_name)
+                except Exception as e:
+                    logger.warning(f"{stock_name}({code}) 情报搜索失败: {e}")
+
+            context = self.db.get_analysis_context(code)
+            if context is None:
+                _mkt_date = get_market_now(
+                    get_market_for_stock(normalize_stock_code(code))
+                ).date()
+                context = {
+                    'code': code, 'stock_name': stock_name,
+                    'date': _mkt_date.isoformat(), 'data_missing': True,
+                    'today': {}, 'yesterday': {},
+                }
+
+            enhanced_context = self._enhance_context(
+                context, realtime_quote, chip_data, trend_result,
+                stock_name, fundamental_context, commodity_context,
+            )
+
+            system_prompt, user_prompt = self.analyzer.build_prompt(
+                enhanced_context, news_context=news_context
+            )
+
+            os.makedirs(output_dir, exist_ok=True)
+            safe_name = stock_name.replace('/', '_').replace('\\', '_')
+            filepath = os.path.join(output_dir, f"{code}_{safe_name}.md")
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(f"# {stock_name}({code}) - Prompt 导出\n\n")
+                f.write(f"> 分析后将 JSON 结果保存到同级 `results/{code}.json`\n\n")
+                f.write("---\n\n")
+                f.write("## System Prompt\n\n")
+                f.write("```\n")
+                f.write(system_prompt)
+                f.write("\n```\n\n")
+                f.write("---\n\n")
+                f.write("## User Message\n\n")
+                f.write(user_prompt)
+                f.write("\n")
+
+            logger.info(f"{stock_name}({code}) Prompt 已导出到: {filepath}")
+            return filepath
+
+        except Exception as e:
+            logger.error(f"{stock_name}({code}) Prompt 导出失败: {e}")
+            logger.exception(f"{stock_name}({code}) 详细错误信息:")
+            return None
+
     def _enhance_context(
         self,
         context: Dict[str, Any],
@@ -525,7 +667,8 @@ class StockAnalysisPipeline:
         chip_data: Optional[ChipDistribution],
         trend_result: Optional[TrendAnalysisResult],
         stock_name: str = "",
-        fundamental_context: Optional[Dict[str, Any]] = None
+        fundamental_context: Optional[Dict[str, Any]] = None,
+        commodity_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         增强分析上下文
@@ -682,6 +825,9 @@ class StockAnalysisPipeline:
             )
         )
 
+        if commodity_context and isinstance(commodity_context, dict):
+            enhanced["commodity_context"] = commodity_context
+
         return enhanced
 
     def _attach_belong_boards_to_fundamental_context(
@@ -745,6 +891,7 @@ class StockAnalysisPipeline:
         chip_data: Optional[ChipDistribution],
         fundamental_context: Optional[Dict[str, Any]] = None,
         trend_result: Optional[TrendAnalysisResult] = None,
+        commodity_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[AnalysisResult]:
         """
         使用 Agent 模式分析单只股票。
@@ -769,6 +916,8 @@ class StockAnalysisPipeline:
                 initial_context["realtime_quote"] = self._safe_to_dict(realtime_quote)
             if chip_data:
                 initial_context["chip_distribution"] = self._safe_to_dict(chip_data)
+            if commodity_context:
+                initial_context["commodity_context"] = commodity_context
             if trend_result:
                 initial_context["trend_result"] = self._safe_to_dict(trend_result)
 

@@ -1265,6 +1265,32 @@ class GeminiAnalyzer:
             logger.error("[generate_text] LLM call failed: %s", exc)
             return None
 
+    def build_prompt(
+        self,
+        context: Dict[str, Any],
+        news_context: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """
+        组装完整的 system prompt + user prompt，不调用 LLM。
+
+        Returns:
+            (system_prompt, user_prompt)
+        """
+        code = context.get('code', 'Unknown')
+        config = self._get_runtime_config()
+        report_language = normalize_report_language(getattr(config, "report_language", "zh"))
+        system_prompt = self._get_analysis_system_prompt(report_language, stock_code=code)
+
+        name = context.get('stock_name')
+        if not name or name.startswith('股票'):
+            if 'realtime' in context and context['realtime'].get('name'):
+                name = context['realtime']['name']
+            else:
+                name = STOCK_NAME_MAP.get(code, f'股票{code}')
+
+        user_prompt = self._format_prompt(context, name, news_context, report_language=report_language)
+        return system_prompt, user_prompt
+
     def analyze(
         self, 
         context: Dict[str, Any],
@@ -1645,6 +1671,32 @@ class GeminiAnalyzer:
 {chr(10).join('- ' + r for r in trend.get('risk_factors', ['无'])) if trend.get('risk_factors') else '- 无'}
 """
         
+        # 关联商品行情（资源类股票增强，非资源股自动跳过）
+        commodity_ctx = context.get("commodity_context")
+        if isinstance(commodity_ctx, dict) and commodity_ctx.get("related_commodities"):
+            prompt += """
+### 关联商品行情（资源股分析参考）
+| 品种 | 现货价 | 主力合约 | 主力价 | 基差率 | 基差含义 |
+|------|--------|----------|--------|--------|----------|
+"""
+            for _c in commodity_ctx["related_commodities"]:
+                _basis = _c.get("dom_basis_rate") or 0
+                _basis_desc = "现货升水" if _basis > 0 else ("期货升水" if _basis < 0 else "-")
+                _spot = _c.get("spot_price", "N/A")
+                _dom_p = _c.get("dom_price", "N/A")
+                prompt += (
+                    f'| {_c.get("name", "?")} '
+                    f'| {_spot} '
+                    f'| {_c.get("dom_contract", "")} '
+                    f'| {_dom_p} '
+                    f'| {_basis:+.2%} '
+                    f'| {_basis_desc} |\n'
+                )
+            prompt += """
+> 基差率 > 0 表示现货升水（现货紧缺信号），< 0 表示期货升水（市场预期走弱）。
+> 请结合商品价格趋势评估该资源股的盈利预期和估值合理性。
+"""
+
         # 添加昨日对比数据
         if 'yesterday' in context:
             volume_change = context.get('volume_change_ratio', 'N/A')

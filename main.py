@@ -216,6 +216,7 @@ def parse_arguments() -> argparse.Namespace:
   python main.py --single-notify    # 启用单股推送模式（每分析完一只立即推送）
   python main.py --schedule         # 启用定时任务模式
   python main.py --market-review    # 仅运行大盘复盘
+  python main.py --export-prompts   # 导出 Prompt 到文件，不调用 LLM
         '''
     )
 
@@ -357,6 +358,20 @@ def parse_arguments() -> argparse.Namespace:
         help='强制回测（即使已有回测结果也重新计算）'
     )
 
+    parser.add_argument(
+        '--export-prompts',
+        action='store_true',
+        help='导出组装好的完整 Prompt（含数据采集），不调用 LLM，用于在 Cursor 等外部模型中分析'
+    )
+
+    parser.add_argument(
+        '--import-analysis',
+        type=str,
+        default=None,
+        metavar='DIR',
+        help='从指定目录导入外部 LLM 分析结果（JSON），生成日报并发送通知。目录格式：exports/YYYYMMDD/'
+    )
+
     return parser.parse_args()
 
 
@@ -461,6 +476,80 @@ def run_full_analysis(
             query_source="cli",
             save_context_snapshot=save_context_snapshot
         )
+
+        # 0. export-prompts 模式：导出 Prompt 后直接返回
+        if getattr(args, 'export_prompts', False):
+            date_str = datetime.now().strftime('%Y%m%d')
+            base_dir = os.path.join("exports", date_str)
+            prompts_dir = os.path.join(base_dir, "prompts")
+            results_dir = os.path.join(base_dir, "results")
+            os.makedirs(prompts_dir, exist_ok=True)
+            os.makedirs(results_dir, exist_ok=True)
+            logger.info(f"===== Prompt 导出模式，输出目录: {base_dir} =====")
+            exported = []
+            for code in stock_codes:
+                filepath = pipeline.export_stock_prompt(
+                    code, output_dir=prompts_dir,
+                    current_time=datetime.now(timezone.utc),
+                )
+                if filepath:
+                    exported.append(filepath)
+            # 写入 metadata
+            import json as _json
+            meta = {
+                "date": date_str,
+                "exported_at": datetime.now().isoformat(),
+                "stock_codes": stock_codes,
+                "exported_files": [os.path.basename(p) for p in exported],
+            }
+            with open(os.path.join(base_dir, "metadata.json"), 'w', encoding='utf-8') as mf:
+                _json.dump(meta, mf, ensure_ascii=False, indent=2)
+            logger.info(f"===== 导出完成：{len(exported)}/{len(stock_codes)} 只股票 =====")
+            logger.info(f"Prompt 目录: {prompts_dir}")
+            logger.info(f"结果目录（待写入）: {results_dir}")
+            for p in exported:
+                logger.info(f"  -> {p}")
+            # 导出大盘复盘 prompt
+            if config.market_review_enabled:
+                try:
+                    from src.market_analyzer import MarketAnalyzer
+                    from src.search_service import SearchService
+
+                    search_svc = None
+                    if config.has_search_capability_enabled():
+                        search_svc = SearchService(
+                            tavily_keys=config.tavily_api_keys,
+                            brave_keys=config.brave_api_keys,
+                            serpapi_keys=config.serpapi_keys,
+                            bocha_keys=config.bocha_api_keys,
+                            minimax_keys=config.minimax_api_keys,
+                            searxng_base_urls=config.searxng_base_urls,
+                            searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                            news_max_age_days=config.news_max_age_days,
+                            news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
+                        )
+                    region = getattr(config, 'market_review_region', 'cn') or 'cn'
+                    ma = MarketAnalyzer(search_service=search_svc, region=region)
+                    market_prompt = ma.build_review_prompt()
+                    market_prompt_path = os.path.join(prompts_dir, "_market_review.md")
+                    with open(market_prompt_path, 'w', encoding='utf-8') as mf:
+                        mf.write("# 大盘复盘 - Prompt 导出\n\n")
+                        mf.write("> 分析后将纯 Markdown 文本结果保存到同级 `results/_market_review.md`\n\n")
+                        mf.write("---\n\n")
+                        mf.write(market_prompt)
+                        mf.write("\n")
+                    logger.info(f"大盘复盘 Prompt 已导出: {market_prompt_path}")
+                except Exception as e:
+                    logger.warning(f"大盘复盘 Prompt 导出失败: {e}")
+
+            logger.info(
+                f"\n下一步：在 Cursor 中对 Claude 说：\n"
+                f"  \"读取 exports/{date_str}/prompts 目录下所有文件逐个分析：\n"
+                f"  个股 prompt 将 JSON 结果保存到 exports/{date_str}/results/{{股票代码}}.json；\n"
+                f"  大盘复盘 prompt 将 Markdown 结果保存到 exports/{date_str}/results/_market_review.md\"\n"
+                f"\n然后运行：python main.py --import-analysis exports/{date_str}"
+            )
+            return
 
         # 1. 运行个股分析
         results = pipeline.run(
@@ -876,6 +965,164 @@ def main() -> int:
                 send_notification=not args.no_notify,
                 override_region=effective_region,
             )
+            return 0
+
+        # 模式1.5: 导入外部分析结果 → 生成日报 + 发邮件
+        if getattr(args, 'import_analysis', None):
+            from src.core.pipeline import StockAnalysisPipeline
+            from src.analyzer import AnalysisResult
+            from src.enums import ReportType
+
+            import_dir = args.import_analysis
+            results_dir = os.path.join(import_dir, "results")
+            if not os.path.isdir(results_dir):
+                logger.error(f"结果目录不存在: {results_dir}")
+                logger.error("请先在 Cursor 中完成分析，将 JSON 保存到 results/ 目录")
+                return 1
+
+            logger.info(f"===== 导入模式：从 {results_dir} 读取分析结果 =====")
+            import json as _json
+
+            def _repair_json(text: str) -> dict:
+                """Parse JSON with auto-repair for unescaped quotes from LLM output."""
+                text = text.strip()
+                if text.startswith("```"):
+                    first_nl = text.index("\n") if "\n" in text else 3
+                    text = text[first_nl + 1:]
+                    if text.endswith("```"):
+                        text = text[:-3].strip()
+                try:
+                    return _json.loads(text)
+                except _json.JSONDecodeError:
+                    pass
+                chars = list(text)
+                out: list[str] = []
+                i = 0
+                in_str = False
+                while i < len(chars):
+                    c = chars[i]
+                    if c == "\\" and in_str:
+                        out.append(c)
+                        i += 1
+                        if i < len(chars):
+                            out.append(chars[i])
+                        i += 1
+                        continue
+                    if c == '"':
+                        if not in_str:
+                            in_str = True
+                            out.append(c)
+                        else:
+                            rest = text[i + 1:].lstrip(" \t")
+                            if not rest or rest[0] in ",:}]\n\r":
+                                in_str = False
+                                out.append(c)
+                            else:
+                                out.append('\\"')
+                        i += 1
+                        continue
+                    out.append(c)
+                    i += 1
+                return _json.loads("".join(out))
+
+            results: List[AnalysisResult] = []
+            for fname in sorted(os.listdir(results_dir)):
+                if not fname.endswith('.json'):
+                    continue
+                fpath = os.path.join(results_dir, fname)
+                try:
+                    with open(fpath, 'r', encoding='utf-8') as f:
+                        raw_text = f.read()
+                    data = _repair_json(raw_text)
+                    code = data.get('code') or fname.replace('.json', '').split('_')[0]
+                    name = data.get('stock_name') or data.get('name', code)
+                    dashboard = data.get('dashboard')
+                    decision_type = data.get('decision_type', '')
+                    if not decision_type:
+                        from src.analyzer import infer_decision_type_from_advice
+                        decision_type = infer_decision_type_from_advice(
+                            data.get('operation_advice', '持有'), default='hold'
+                        )
+                    result = AnalysisResult(
+                        code=code, name=name,
+                        sentiment_score=int(data.get('sentiment_score', 50)),
+                        trend_prediction=data.get('trend_prediction', '震荡'),
+                        operation_advice=data.get('operation_advice', '持有'),
+                        decision_type=decision_type,
+                        confidence_level=data.get('confidence_level', '中'),
+                        dashboard=dashboard,
+                        trend_analysis=data.get('trend_analysis', ''),
+                        short_term_outlook=data.get('short_term_outlook', ''),
+                        medium_term_outlook=data.get('medium_term_outlook', ''),
+                        technical_analysis=data.get('technical_analysis', ''),
+                        ma_analysis=data.get('ma_analysis', ''),
+                        volume_analysis=data.get('volume_analysis', ''),
+                        pattern_analysis=data.get('pattern_analysis', ''),
+                        fundamental_analysis=data.get('fundamental_analysis', ''),
+                        sector_position=data.get('sector_position', ''),
+                        company_highlights=data.get('company_highlights', ''),
+                        news_summary=data.get('news_summary', ''),
+                        market_sentiment=data.get('market_sentiment', ''),
+                        hot_topics=data.get('hot_topics', ''),
+                        analysis_summary=data.get('analysis_summary', ''),
+                        key_points=data.get('key_points', ''),
+                        risk_warning=data.get('risk_warning', ''),
+                        buy_reason=data.get('buy_reason', ''),
+                        search_performed=data.get('search_performed', False),
+                        data_sources=data.get('data_sources', ''),
+                        model_used=data.get('model_used', 'cursor/claude'),
+                        success=True,
+                    )
+                    results.append(result)
+                    logger.info(f"  已导入: {name}({code}) 评分={result.sentiment_score} 建议={result.operation_advice}")
+                except Exception as e:
+                    logger.error(f"  导入失败 {fname}: {e}")
+
+            if not results:
+                logger.error("未找到有效的分析结果文件")
+                return 1
+
+            logger.info(f"成功导入 {len(results)} 只股票的分析结果")
+
+            query_id = uuid.uuid4().hex
+            pipeline = StockAnalysisPipeline(
+                config=config,
+                max_workers=1,
+                query_id=query_id,
+                query_source="import",
+            )
+
+            pipeline._save_local_report(results, ReportType.SIMPLE)
+            logger.info("本地报告已保存")
+
+            if not getattr(args, 'no_notify', False):
+                pipeline._send_notifications(results, ReportType.SIMPLE)
+                logger.info("通知已发送")
+
+            # 处理大盘复盘结果
+            market_review_path = os.path.join(results_dir, "_market_review.md")
+            market_report = ""
+            if os.path.isfile(market_review_path):
+                with open(market_review_path, 'r', encoding='utf-8') as mf:
+                    market_report = mf.read().strip()
+                if market_report:
+                    date_str = datetime.now().strftime('%Y%m%d')
+                    review_filename = f"market_review_{date_str}.md"
+                    filepath = pipeline.notifier.save_report_to_file(
+                        f"# 🎯 大盘复盘\n\n{market_report}",
+                        review_filename,
+                    )
+                    logger.info(f"大盘复盘报告已保存: {filepath}")
+                    if not getattr(args, 'no_notify', False) and pipeline.notifier.is_available():
+                        pipeline.notifier.send(
+                            f"🎯 大盘复盘\n\n{market_report}",
+                            email_send_to_all=True,
+                        )
+                        logger.info("大盘复盘通知已发送")
+            elif not getattr(args, 'no_market_review', False):
+                logger.info("未找到大盘复盘结果文件 (_market_review.md)，跳过大盘复盘")
+
+            logger.info("===== 导入分析完成 =====")
             return 0
 
         # 模式2: 定时任务模式

@@ -26,6 +26,7 @@ import pandas as pd
 import numpy as np
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 from .fundamental_adapter import AkshareFundamentalAdapter
+from .commodity_provider import CommodityContextProvider
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -503,6 +504,7 @@ class DataFetcherManager:
             # 默认数据源将在首次使用时延迟加载
             self._init_default_fetchers()
         self._fundamental_adapter = AkshareFundamentalAdapter()
+        self._commodity_provider = CommodityContextProvider()
         self._tickflow_fetcher = None
         self._tickflow_api_key: Optional[str] = None
         self._tickflow_lock = RLock()
@@ -1925,6 +1927,16 @@ class DataFetcherManager:
             "errors": [reason],
             **blocks,
         }
+
+    def get_commodity_context(
+        self, stock_code: str, stock_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return commodity price context for resource-related stocks, or ``None``."""
+        try:
+            return self._commodity_provider.get_commodity_context(stock_code, stock_name)
+        except Exception as exc:
+            logger.debug("get_commodity_context failed for %s: %s", stock_code, exc)
+            return None
 
     def build_failed_fundamental_context(self, stock_code: str, reason: str) -> Dict[str, Any]:
         """Build a consistent failed-context payload for caller-side fallback."""

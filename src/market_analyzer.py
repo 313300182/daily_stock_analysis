@@ -670,6 +670,17 @@ Output the report content directly, no extra commentary.
 """
         return report
     
+    def build_review_prompt(self) -> str:
+        """
+        采集数据并组装大盘复盘 prompt（不调用 LLM）。
+
+        Returns:
+            完整的大盘复盘 prompt 文本
+        """
+        overview = self.get_market_overview()
+        news = self.search_market_news()
+        return self._build_review_prompt(overview, news)
+
     def run_daily_review(self) -> str:
         """
         执行每日大盘复盘流程

@@ -78,3 +78,6 @@ verify_*.py
 static/
 /apps/dsa-desktop/dist/
 /apps/dsa-desktop/node_modules/
+
+# 导出文件
+exports/
