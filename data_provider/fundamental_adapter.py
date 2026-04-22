@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -272,21 +273,57 @@ class AkshareFundamentalAdapter:
         try:
             import akshare as ak
         except Exception as exc:
+            logger.warning("[FundamentalAdapter] import akshare 失败: %s", exc)
             return None, None, [f"import_akshare:{type(exc).__name__}"]
 
         for func_name, kwargs in candidates:
             fn = getattr(ak, func_name, None)
             if fn is None:
+                logger.debug("[FundamentalAdapter] akshare.%s 不存在，跳过", func_name)
                 continue
+            _start = time.time()
             try:
+                logger.info(
+                    "[FundamentalAdapter][Call] akshare.%s(%s) 开始调用",
+                    func_name,
+                    kwargs,
+                )
                 df = fn(**kwargs)
                 if isinstance(df, pd.Series):
                     df = df.to_frame().T
+                _elapsed = time.time() - _start
                 if isinstance(df, pd.DataFrame) and not df.empty:
+                    logger.info(
+                        "[FundamentalAdapter][OK] akshare.%s 成功: rows=%d, cols=%d, elapsed=%.2fs, first_col=%s",
+                        func_name,
+                        len(df),
+                        len(df.columns),
+                        _elapsed,
+                        list(df.columns)[:3],
+                    )
                     return df, func_name, errors
+                else:
+                    logger.warning(
+                        "[FundamentalAdapter][Empty] akshare.%s 返回空 DataFrame, elapsed=%.2fs",
+                        func_name,
+                        _elapsed,
+                    )
             except Exception as exc:
+                _elapsed = time.time() - _start
+                logger.warning(
+                    "[FundamentalAdapter][Fail] akshare.%s 调用失败(%s): %s, elapsed=%.2fs",
+                    func_name,
+                    type(exc).__name__,
+                    exc,
+                    _elapsed,
+                )
                 errors.append(f"{func_name}:{type(exc).__name__}")
                 continue
+        if errors:
+            logger.warning(
+                "[FundamentalAdapter][AllFailed] 全部候选源失败, errors=%s",
+                errors,
+            )
         return None, None, errors
 
     def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
@@ -411,6 +448,17 @@ class AkshareFundamentalAdapter:
 
         has_content = bool(result["growth"] or result["earnings"] or result["institution"])
         result["status"] = "partial" if has_content else "not_supported"
+        logger.info(
+            "[FundamentalAdapter][Bundle] stock=%s status=%s growth_keys=%s earnings_keys=%s "
+            "institution_keys=%s source_chain=%s errors=%s",
+            stock_code,
+            result["status"],
+            list(result["growth"].keys()),
+            list(result["earnings"].keys()),
+            list(result["institution"].keys()),
+            result["source_chain"],
+            result["errors"],
+        )
         return result
 
     def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:

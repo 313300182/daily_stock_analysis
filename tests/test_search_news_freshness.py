@@ -331,8 +331,8 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
             news_strategy_profile="medium",  # min(7,3)=3
         )
         mock_search.side_effect = [
-            _response([_result("old", old), _result("fresh", fresh)]),
-            _response([_result("analysis_unknown", None), _result("analysis_dated", analysis_text)]),
+            _response([_result("旧新闻", old), _result("最新动态", fresh)]),
+            _response([_result("研报分析", None), _result("机构评级", analysis_text)]),
         ]
         with patch("src.search_service.time.sleep"):
             intel = service.search_comprehensive_intel(
@@ -347,10 +347,10 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
             self.assertEqual(kwargs["days"], 3)
             self.assertEqual(kwargs["max_results"], 6)  # target 3 -> overfetch 6
 
-        self.assertEqual([item.title for item in intel["latest_news"].results], ["fresh"])
+        self.assertEqual([item.title for item in intel["latest_news"].results], ["最新动态"])
         self.assertEqual(
             [item.title for item in intel["market_analysis"].results],
-            ["analysis_unknown", "analysis_dated"],
+            ["研报分析", "机构评级"],
         )
         self.assertIsNone(intel["market_analysis"].results[0].published_date)
         self.assertEqual(intel["market_analysis"].results[1].published_date, expected_analysis_date)
@@ -366,9 +366,9 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
             news_strategy_profile="short",
         )
         mock_search.side_effect = [
-            _response([_result("latest_news", fresh_text)]),
-            _response([_result("market_analysis_unknown", None)]),
-            _response([_result("risk_unknown", None)]),
+            _response([_result("最新消息", fresh_text)]),
+            _response([_result("机构分析未知日期", None)]),
+            _response([_result("风险项未知日期", None)]),
         ]
 
         with patch("src.search_service.time.sleep"):
@@ -379,9 +379,9 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
             )
 
         self.assertEqual(intel["latest_news"].results[0].published_date, expected_fresh_date)
-        self.assertEqual([item.title for item in intel["market_analysis"].results], ["market_analysis_unknown"])
+        self.assertEqual([item.title for item in intel["market_analysis"].results], ["机构分析未知日期"])
         self.assertIsNone(intel["market_analysis"].results[0].published_date)
-        self.assertEqual([item.title for item in intel["risk_check"].results], ["risk_unknown"])
+        self.assertEqual([item.title for item in intel["risk_check"].results], ["风险项未知日期"])
         self.assertIsNone(intel["risk_check"].results[0].published_date)
 
     def test_search_comprehensive_intel_non_etf_risk_check_stays_strict(self) -> None:
@@ -395,9 +395,9 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
             news_strategy_profile="short",
         )
         mock_search.side_effect = [
-            _response([_result("latest_news", fresh_text)]),
-            _response([_result("market_analysis_unknown", None)]),
-            _response([_result("risk_unknown", None)]),
+            _response([_result("最新消息", fresh_text)]),
+            _response([_result("机构分析未知日期", None)]),
+            _response([_result("风险项未知日期", None)]),
         ]
 
         with patch("src.search_service.time.sleep"):
@@ -408,7 +408,7 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
             )
 
         self.assertEqual(intel["latest_news"].results[0].published_date, expected_fresh_date)
-        self.assertEqual([item.title for item in intel["market_analysis"].results], ["market_analysis_unknown"])
+        self.assertEqual([item.title for item in intel["market_analysis"].results], ["机构分析未知日期"])
         self.assertIsNone(intel["market_analysis"].results[0].published_date)
         self.assertEqual(intel["risk_check"].results, [])
 
@@ -422,10 +422,10 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
             news_strategy_profile="short",
         )
         mock_search.side_effect = [
-            _response([_result("latest_news", fresh_text)]),
-            _response([_result("market_analysis", None)]),
-            _response([_result("risk_check", fresh_text)]),
-            _response([_result("announcement_item", fresh_text)]),
+            _response([_result("最新消息", fresh_text)]),
+            _response([_result("机构分析", None)]),
+            _response([_result("风险排查", fresh_text)]),
+            _response([_result("公司公告条目", fresh_text)]),
         ]
 
         with patch("src.search_service.time.sleep"):
@@ -438,7 +438,7 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         self.assertIn("announcements", intel)
         self.assertEqual(
             [item.title for item in intel["announcements"].results],
-            ["announcement_item"],
+            ["公司公告条目"],
         )
 
     def test_announcements_dimension_uses_news_topic_and_strict_filter(self) -> None:
@@ -452,10 +452,10 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
             news_strategy_profile="short",
         )
         mock_search.side_effect = [
-            _response([_result("latest_news", fresh_text)]),
-            _response([_result("market_analysis", None)]),
-            _response([_result("risk_check", fresh_text)]),
-            _response([_result("old_announcement", old), _result("fresh_announcement", fresh_text)]),
+            _response([_result("最新消息", fresh_text)]),
+            _response([_result("机构分析", None)]),
+            _response([_result("风险排查", fresh_text)]),
+            _response([_result("旧公告", old), _result("新公告", fresh_text)]),
         ]
 
         with patch("src.search_service.time.sleep"):
@@ -468,8 +468,8 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         self.assertIn("announcements", intel)
         # strict_freshness=True: stale result is filtered out
         titles = [item.title for item in intel["announcements"].results]
-        self.assertNotIn("old_announcement", titles)
-        self.assertIn("fresh_announcement", titles)
+        self.assertNotIn("旧公告", titles)
+        self.assertIn("新公告", titles)
 
     def test_announcements_etf_is_not_strict(self) -> None:
         """For ETF, announcements dimension also uses tavily_topic='news' and strict_freshness=True."""

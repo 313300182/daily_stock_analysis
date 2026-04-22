@@ -29,12 +29,12 @@ echo ============================================
 echo  导出完成！Prompt 目录: exports\%TODAY%\prompts
 echo ============================================
 echo.
-echo  现在请在 Cursor 中对 Claude 说：
+echo  [下一步] 在 Cursor 中对 Claude 说:
 echo.
-echo  读取 exports/%TODAY%/prompts 目录下所有文件逐个分析：
-echo  个股 prompt 将 JSON 结果保存到 exports/%TODAY%/results/{股票代码}.json；
-echo  大盘复盘 prompt 将 Markdown 结果保存到 exports/%TODAY%/results/_market_review.md
+echo  读取 exports/%TODAY%/prompts 目录下所有文件逐个分析,
+echo  个股 prompt 结果保存到 exports/%TODAY%/results/ 目录,
+echo  大盘复盘结果保存到 exports/%TODAY%/results/_market_review.md
 echo.
-echo  分析完成后，运行 daily_import.bat 生成日报并发送邮件。
+echo  分析完成后, 运行 daily_import.bat 生成日报并发送邮件。
 echo ============================================
 pause

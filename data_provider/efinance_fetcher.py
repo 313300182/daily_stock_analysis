@@ -479,57 +479,82 @@ class EfinanceFetcher(BaseFetcher):
         logger.info(f"[API调用] ef.stock.get_quote_history(stock_codes={stock_code}, "
                      f"beg={beg_date}, end={end_date_fmt}, klt=101, fqt=1)  [ETF]")
 
-        api_start = time.time()
-        try:
-            # ETFs are exchange-traded securities; use the stock API to get full OHLCV data
-            df = _ef_call_with_timeout(
-                ef.stock.get_quote_history,
-                stock_codes=stock_code,
-                beg=beg_date,
-                end=end_date_fmt,
-                klt=101,  # daily
-                fqt=1,    # forward-adjusted
-                timeout=60,
-            )
-
-            api_elapsed = time.time() - api_start
-
-            if df is not None and not df.empty:
-                logger.info(
-                    "[API返回] Eastmoney 历史K线成功 [ETF]: "
-                    f"endpoint={EASTMONEY_HISTORY_ENDPOINT}, stock_code={stock_code}, "
-                    f"range={beg_date}~{end_date_fmt}, rows={len(df)}, elapsed={api_elapsed:.2f}s"
-                )
-                logger.info(f"[API返回] 列名: {list(df.columns)}")
-                if '日期' in df.columns:
-                    logger.info(f"[API返回] 日期范围: {df['日期'].iloc[0]} ~ {df['日期'].iloc[-1]}")
-                logger.debug(f"[API返回] 最新3条数据:\n{df.tail(3).to_string()}")
-            else:
+        retry_delays = [0.0, 0.5, 1.5]  # 首次 + 2 次退避重试（覆盖 RemoteDisconnected）
+        last_exc: Optional[Exception] = None
+        for attempt, delay in enumerate(retry_delays):
+            if delay > 0:
                 logger.warning(
-                    "[API返回] Eastmoney 历史K线为空 [ETF]: "
-                    f"endpoint={EASTMONEY_HISTORY_ENDPOINT}, stock_code={stock_code}, "
-                    f"range={beg_date}~{end_date_fmt}, elapsed={api_elapsed:.2f}s"
+                    f"[重试{attempt}/{len(retry_delays)-1}] ef.stock.get_quote_history(ETF={stock_code}) "
+                    f"上次失败({type(last_exc).__name__ if last_exc else '?'})，{delay}s 后重试"
+                )
+                time.sleep(delay)
+            api_start = time.time()
+            try:
+                df = _ef_call_with_timeout(
+                    ef.stock.get_quote_history,
+                    stock_codes=stock_code,
+                    beg=beg_date,
+                    end=end_date_fmt,
+                    klt=101,
+                    fqt=1,
+                    timeout=60,
                 )
 
-            return df
+                api_elapsed = time.time() - api_start
 
-        except Exception as e:
-            api_elapsed = time.time() - api_start
-            category, failure_message = self._build_history_failure_message(
-                stock_code=stock_code,
-                beg_date=beg_date,
-                end_date=end_date_fmt,
-                exc=e,
-                elapsed=api_elapsed,
-                is_etf=True,
-            )
+                if df is not None and not df.empty:
+                    logger.info(
+                        "[API返回] Eastmoney 历史K线成功 [ETF]: "
+                        f"endpoint={EASTMONEY_HISTORY_ENDPOINT}, stock_code={stock_code}, "
+                        f"range={beg_date}~{end_date_fmt}, rows={len(df)}, elapsed={api_elapsed:.2f}s"
+                    )
+                    logger.info(f"[API返回] 列名: {list(df.columns)}")
+                    if '日期' in df.columns:
+                        logger.info(f"[API返回] 日期范围: {df['日期'].iloc[0]} ~ {df['日期'].iloc[-1]}")
+                    logger.debug(f"[API返回] 最新3条数据:\n{df.tail(3).to_string()}")
+                else:
+                    logger.warning(
+                        "[API返回] Eastmoney 历史K线为空 [ETF]: "
+                        f"endpoint={EASTMONEY_HISTORY_ENDPOINT}, stock_code={stock_code}, "
+                        f"range={beg_date}~{end_date_fmt}, elapsed={api_elapsed:.2f}s"
+                    )
 
-            if category == "rate_limit_or_anti_bot":
-                logger.warning(failure_message)
-                raise RateLimitError(f"efinance 可能被限流: {failure_message}") from e
+                return df
 
-            logger.error(failure_message)
-            raise DataFetchError(f"efinance 获取 ETF 数据失败: {failure_message}") from e
+            except Exception as e:
+                last_exc = e
+                api_elapsed = time.time() - api_start
+                category, failure_message = self._build_history_failure_message(
+                    stock_code=stock_code,
+                    beg_date=beg_date,
+                    end_date=end_date_fmt,
+                    exc=e,
+                    elapsed=api_elapsed,
+                    is_etf=True,
+                )
+
+                if category == "rate_limit_or_anti_bot":
+                    logger.warning(failure_message)
+                    raise RateLimitError(f"efinance 可能被限流: {failure_message}") from e
+
+                _err_msg = str(e).lower()
+                is_transient = (
+                    'remotedisconnected' in _err_msg
+                    or 'connection' in _err_msg
+                    or 'timeout' in _err_msg
+                    or 'timed out' in _err_msg
+                    or 'reset' in _err_msg
+                )
+                if is_transient and attempt < len(retry_delays) - 1:
+                    logger.warning(
+                        f"[瞬时错误] ef.stock.get_quote_history(ETF={stock_code}) {type(e).__name__}: {e}，准备重试"
+                    )
+                    continue
+
+                logger.error(failure_message)
+                raise DataFetchError(f"efinance 获取 ETF 数据失败: {failure_message}") from e
+
+        raise DataFetchError(f"efinance 获取 ETF 数据失败: {last_exc}") from last_exc
     
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """

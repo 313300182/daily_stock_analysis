@@ -109,6 +109,78 @@ class AnalyzerNewsPromptTestCase(unittest.TestCase):
         self.assertIn("近1日的新闻搜索结果", prompt)
         self.assertIn("超出近1日窗口的新闻一律忽略", prompt)
 
+    def test_financial_and_dividend_both_empty_renders_warning(self) -> None:
+        """财报与分红均为空时，Prompt 不应渲染表格，而应给出明确警示。"""
+        with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
+            analyzer = GeminiAnalyzer()
+
+        context = {
+            "code": "600519",
+            "stock_name": "贵州茅台",
+            "date": "2026-03-16",
+            "today": {},
+            "fundamental_context": {
+                "earnings": {
+                    "data": {
+                        "financial_report": {},
+                        "dividend": {},
+                    }
+                }
+            },
+        }
+        fake_cfg = SimpleNamespace(
+            news_max_age_days=30,
+            news_strategy_profile="medium",
+        )
+        with patch("src.analyzer.get_config", return_value=fake_cfg):
+            prompt = analyzer._format_prompt(context, "贵州茅台", news_context=None)
+
+        self.assertIn("财报与分红（价值投资口径）", prompt)
+        self.assertNotIn("| 最近报告期 |", prompt)
+        self.assertIn("⚠️ 财报 / 分红数据未获取到", prompt)
+        self.assertIn("FUNDAMENTAL_STAGE_TIMEOUT_SECONDS", prompt)
+
+    def test_financial_only_partial_dividend_empty(self) -> None:
+        """只有财报有值、分红为空时，Prompt 应渲染财报行 + 分红缺失提示。"""
+        with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
+            analyzer = GeminiAnalyzer()
+
+        context = {
+            "code": "600519",
+            "stock_name": "贵州茅台",
+            "date": "2026-03-16",
+            "today": {},
+            "fundamental_context": {
+                "earnings": {
+                    "data": {
+                        "financial_report": {
+                            "report_date": "2025-12-31",
+                            "revenue": 1000,
+                        },
+                        "dividend": {},
+                    }
+                }
+            },
+        }
+        fake_cfg = SimpleNamespace(
+            news_max_age_days=30,
+            news_strategy_profile="medium",
+        )
+        with patch("src.analyzer.get_config", return_value=fake_cfg):
+            prompt = analyzer._format_prompt(context, "贵州茅台", news_context=None)
+
+        self.assertIn("| 最近报告期 | 2025-12-31", prompt)
+        self.assertNotIn("| TTM 股息率 |", prompt)
+        self.assertIn("分红数据 | 未获取到", prompt)
+
+    def test_has_any_value_helper(self) -> None:
+        self.assertFalse(GeminiAnalyzer._has_any_value(None))
+        self.assertFalse(GeminiAnalyzer._has_any_value({}))
+        self.assertFalse(GeminiAnalyzer._has_any_value({"a": None, "b": "N/A", "c": ""}))
+        self.assertFalse(GeminiAnalyzer._has_any_value({"a": "--", "b": "  "}))
+        self.assertTrue(GeminiAnalyzer._has_any_value({"a": None, "b": "2025-12-31"}))
+        self.assertTrue(GeminiAnalyzer._has_any_value({"a": 3.14}))
+
     def test_format_prompt_omits_legacy_trend_checks_for_nondefault_skill_mode(self) -> None:
         with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
             analyzer = GeminiAnalyzer(

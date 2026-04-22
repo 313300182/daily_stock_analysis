@@ -12,6 +12,7 @@ A股自选股智能分析系统 - 搜索服务模块
 """
 
 import logging
+import os
 import re
 import threading
 import time
@@ -294,6 +295,7 @@ class TavilySearchProvider(BaseSearchProvider):
         max_results: int,
         days: int = 7,
         topic: Optional[str] = None,
+        include_domains: Optional[List[str]] = None,
     ) -> SearchResponse:
         """执行 Tavily 搜索"""
         try:
@@ -321,6 +323,9 @@ class TavilySearchProvider(BaseSearchProvider):
             }
             if topic is not None:
                 search_kwargs["topic"] = topic
+            if include_domains:
+                # Tavily API 支持 include_domains 列表，限定搜索域名范围
+                search_kwargs["include_domains"] = list(include_domains)
 
             response = client.search(
                 **search_kwargs,
@@ -368,9 +373,10 @@ class TavilySearchProvider(BaseSearchProvider):
         max_results: int = 5,
         days: int = 7,
         topic: Optional[str] = None,
+        include_domains: Optional[List[str]] = None,
     ) -> SearchResponse:
-        """执行 Tavily 搜索，可按调用方选择是否启用新闻 topic。"""
-        if topic is None:
+        """执行 Tavily 搜索，可按调用方选择是否启用新闻 topic 以及限定来源域名。"""
+        if topic is None and not include_domains:
             return super().search(query, max_results=max_results, days=days)
 
         api_key = self._get_next_key()
@@ -385,7 +391,14 @@ class TavilySearchProvider(BaseSearchProvider):
 
         start_time = time.time()
         try:
-            response = self._do_search(query, api_key, max_results, days=days, topic=topic)
+            response = self._do_search(
+                query,
+                api_key,
+                max_results,
+                days=days,
+                topic=topic,
+                include_domains=include_domains,
+            )
             response.search_time = time.time() - start_time
 
             if response.success:
@@ -2082,6 +2095,479 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+class _CodeAwareSearchProvider(BaseSearchProvider):
+    """公共基类：按股票代码（stock_code）拉新闻的 Provider（AkShare 封装）。
+
+    这类 Provider 的 query 主要作为关键词二次过滤器，主查询是按 stock_code。
+    """
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider=self._name,
+            success=False,
+            error_message=f"{self._name} 仅支持 search_by_code，不支持按关键词的 _do_search",
+        )
+
+    @staticmethod
+    def _parse_datetime(val: Any) -> Optional[datetime]:
+        if not val:
+            return None
+        try:
+            if hasattr(val, "to_pydatetime"):
+                return val.to_pydatetime()
+            if isinstance(val, datetime):
+                return val
+            s = str(val).strip()
+            if not s:
+                return None
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d",
+                "%Y/%m/%d %H:%M:%S",
+                "%Y/%m/%d",
+            ):
+                try:
+                    return datetime.strptime(s, fmt)
+                except ValueError:
+                    continue
+        except Exception:
+            return None
+        return None
+
+
+class EastmoneyNewsProvider(_CodeAwareSearchProvider):
+    """
+    东方财富个股新闻 Provider（通过 akshare.stock_news_em）。
+
+    仅用于 A 股场景；按 stock_code 拉新闻，然后按 days 本地过滤时效。
+    fail-open：任何异常都降级为 success=False，不影响主流程。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(api_keys=["local-akshare"], name="Eastmoney")
+
+    @property
+    def is_available(self) -> bool:
+        try:
+            import akshare  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def search_by_code(
+        self,
+        stock_code: str,
+        query: str = "",
+        max_results: int = 10,
+        days: int = 7,
+    ) -> SearchResponse:
+        start_time = time.time()
+        try:
+            import akshare as ak
+        except Exception as e:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"akshare 未安装或不可用: {e}",
+                search_time=time.time() - start_time,
+            )
+
+        fn = getattr(ak, "stock_news_em", None)
+        if fn is None:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message="akshare.stock_news_em 不存在（版本过旧？）",
+                search_time=time.time() - start_time,
+            )
+
+        try:
+            logger.info("[Eastmoney] 调用 ak.stock_news_em(symbol=%s)", stock_code)
+            df = fn(symbol=stock_code)
+        except Exception as e:
+            logger.warning("[Eastmoney] ak.stock_news_em(%s) 调用失败: %s", stock_code, e)
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"stock_news_em 调用失败: {e}",
+                search_time=time.time() - start_time,
+            )
+
+        if df is None or getattr(df, "empty", True):
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=True,
+                error_message=None,
+                search_time=time.time() - start_time,
+            )
+
+        col_map: Dict[str, Any] = {}
+        for c in df.columns:
+            cs = str(c)
+            if "标题" in cs:
+                col_map["title"] = c
+            elif "内容" in cs or "摘要" in cs:
+                col_map["content"] = c
+            elif "时间" in cs or "日期" in cs:
+                col_map["time"] = c
+            elif "来源" in cs or "媒体" in cs:
+                col_map["source"] = c
+            elif "链接" in cs or "URL" in cs.upper() or "地址" in cs:
+                col_map["url"] = c
+
+        cutoff = datetime.now() - timedelta(days=max(1, int(days)))
+        results: List[SearchResult] = []
+        query_lower = (query or "").strip().lower()
+
+        try:
+            rows = df.to_dict(orient="records")
+        except Exception:
+            rows = []
+
+        for row in rows:
+            title = str(row.get(col_map.get("title", ""), "") or "")
+            content = str(row.get(col_map.get("content", ""), "") or "")
+            url = str(row.get(col_map.get("url", ""), "") or "")
+            source = str(row.get(col_map.get("source", ""), "") or "东方财富")
+            published_raw = row.get(col_map.get("time", ""), None)
+            published_dt = self._parse_datetime(published_raw)
+            if published_dt is not None and published_dt < cutoff:
+                continue
+            if query_lower:
+                merged = (title + " " + content).lower()
+                if query_lower not in merged:
+                    continue
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=content[:500],
+                    url=url,
+                    source=source or "东方财富",
+                    published_date=(published_dt.isoformat() if published_dt is not None else (str(published_raw) if published_raw else None)),
+                )
+            )
+            if len(results) >= max_results:
+                break
+
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=self._name,
+            success=True,
+            error_message=None,
+            search_time=time.time() - start_time,
+        )
+
+    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider=self._name,
+            success=False,
+            error_message="EastmoneyNewsProvider 需通过 search_by_code(stock_code=...) 调用",
+        )
+
+
+class SinaFinanceNewsProvider(_CodeAwareSearchProvider):
+    """
+    新浪财经/财联社新闻 Provider。
+
+    优先级：
+    1. akshare.stock_news_sina(symbol=code) —— 若可用
+    2. akshare.stock_info_global_cls —— 财联社电报，按 stock_name 本地过滤
+    """
+
+    def __init__(self) -> None:
+        super().__init__(api_keys=["local-akshare"], name="SinaFinance")
+
+    @property
+    def is_available(self) -> bool:
+        try:
+            import akshare  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def search_by_code(
+        self,
+        stock_code: str,
+        query: str = "",
+        stock_name: str = "",
+        max_results: int = 10,
+        days: int = 7,
+    ) -> SearchResponse:
+        start_time = time.time()
+        try:
+            import akshare as ak
+        except Exception as e:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"akshare 未安装或不可用: {e}",
+                search_time=time.time() - start_time,
+            )
+
+        cutoff = datetime.now() - timedelta(days=max(1, int(days)))
+        results: List[SearchResult] = []
+        last_error: Optional[str] = None
+
+        fn_sina = getattr(ak, "stock_news_sina", None)
+        if fn_sina is not None:
+            try:
+                logger.info("[SinaFinance] 调用 ak.stock_news_sina(symbol=%s)", stock_code)
+                df = fn_sina(symbol=stock_code)
+                results.extend(self._normalize_df(
+                    df, default_source="新浪财经", cutoff=cutoff,
+                    max_results=max_results, query=query,
+                ))
+            except Exception as e:
+                last_error = f"stock_news_sina: {e}"
+                logger.debug("[SinaFinance] stock_news_sina 调用失败: %s", e)
+
+        if len(results) < max_results:
+            fn_cls = getattr(ak, "stock_info_global_cls", None)
+            if fn_cls is not None and stock_name:
+                try:
+                    logger.info("[SinaFinance] 调用 ak.stock_info_global_cls('全部') 并按 '%s' 过滤", stock_name)
+                    df = fn_cls(symbol="全部")
+                    cls_results = self._normalize_df(
+                        df, default_source="财联社", cutoff=cutoff,
+                        max_results=max_results - len(results),
+                        query=stock_name or query,
+                    )
+                    results.extend(cls_results)
+                except Exception as e:
+                    last_error = f"stock_info_global_cls: {e}"
+                    logger.debug("[SinaFinance] stock_info_global_cls 调用失败: %s", e)
+
+        if not results and last_error:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=last_error,
+                search_time=time.time() - start_time,
+            )
+
+        return SearchResponse(
+            query=query,
+            results=results[:max_results],
+            provider=self._name,
+            success=True,
+            error_message=None,
+            search_time=time.time() - start_time,
+        )
+
+    def _normalize_df(
+        self,
+        df: Any,
+        *,
+        default_source: str,
+        cutoff: datetime,
+        max_results: int,
+        query: str = "",
+    ) -> List[SearchResult]:
+        if df is None or getattr(df, "empty", True):
+            return []
+
+        col_title = col_content = col_time = col_source = col_url = None
+        for c in df.columns:
+            cs = str(c)
+            if "标题" in cs or "快讯" in cs:
+                col_title = col_title or c
+            elif "内容" in cs or "摘要" in cs or "概要" in cs:
+                col_content = col_content or c
+            elif "时间" in cs or "日期" in cs:
+                col_time = col_time or c
+            elif "来源" in cs or "媒体" in cs:
+                col_source = col_source or c
+            elif "链接" in cs or "地址" in cs or "URL" in cs.upper():
+                col_url = col_url or c
+
+        out: List[SearchResult] = []
+        q_lower = (query or "").strip().lower()
+        try:
+            rows = df.to_dict(orient="records")
+        except Exception:
+            return []
+
+        for row in rows:
+            title = str(row.get(col_title, "") or "") if col_title else ""
+            content = str(row.get(col_content, "") or "") if col_content else ""
+            if not title and not content:
+                continue
+            merged = (title + " " + content).lower()
+            if q_lower and q_lower not in merged:
+                continue
+            published_raw = row.get(col_time) if col_time else None
+            published_dt = self._parse_datetime(published_raw)
+            if published_dt is not None and published_dt < cutoff:
+                continue
+            out.append(
+                SearchResult(
+                    title=title or content[:50],
+                    snippet=(content[:500] or title[:500]),
+                    url=str(row.get(col_url, "") or "") if col_url else "",
+                    source=(str(row.get(col_source, "") or default_source) if col_source else default_source),
+                    published_date=(published_dt.isoformat() if published_dt is not None else (str(published_raw) if published_raw else None)),
+                )
+            )
+            if len(out) >= max_results:
+                break
+        return out
+
+    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider=self._name,
+            success=False,
+            error_message="SinaFinanceNewsProvider 需通过 search_by_code(stock_code=...) 调用",
+        )
+
+
+class XueqiuNewsProvider(_CodeAwareSearchProvider):
+    """
+    雪球社交讨论 Provider（实验性）。
+
+    雪球无官方公共 API，仅依赖 akshare 封装（akshare.stock_news_xq 等），
+    稳定性较差；默认关闭，仅在 ENABLE_XUEQIU_NEWS=true 时注入 SearchService。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(api_keys=["local-akshare"], name="Xueqiu")
+
+    @property
+    def is_available(self) -> bool:
+        try:
+            import akshare as ak
+            return any(getattr(ak, n, None) is not None for n in ("stock_news_xq",))
+        except Exception:
+            return False
+
+    def search_by_code(
+        self,
+        stock_code: str,
+        query: str = "",
+        max_results: int = 10,
+        days: int = 7,
+    ) -> SearchResponse:
+        start_time = time.time()
+        try:
+            import akshare as ak
+        except Exception as e:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"akshare 未安装或不可用: {e}",
+                search_time=time.time() - start_time,
+            )
+
+        fn = getattr(ak, "stock_news_xq", None)
+        if fn is None:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message="akshare.stock_news_xq 不存在（雪球 Provider 当前不可用）",
+                search_time=time.time() - start_time,
+            )
+
+        try:
+            logger.info("[Xueqiu] 调用 ak.stock_news_xq(symbol=%s)", stock_code)
+            df = fn(symbol=stock_code)
+        except Exception as e:
+            logger.warning("[Xueqiu] ak.stock_news_xq 调用失败: %s", e)
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"stock_news_xq 调用失败: {e}",
+                search_time=time.time() - start_time,
+            )
+
+        cutoff = datetime.now() - timedelta(days=max(1, int(days)))
+        results: List[SearchResult] = []
+        q_lower = (query or "").strip().lower()
+
+        try:
+            rows = df.to_dict(orient="records") if df is not None else []
+        except Exception:
+            rows = []
+
+        for row in rows:
+            title = ""
+            content = ""
+            published_raw = None
+            url = ""
+            for k, v in row.items():
+                ks = str(k)
+                if "标题" in ks:
+                    title = str(v or "")
+                elif "内容" in ks or "摘要" in ks:
+                    content = str(v or "")
+                elif "时间" in ks or "日期" in ks:
+                    published_raw = v
+                elif "链接" in ks or "URL" in ks.upper():
+                    url = str(v or "")
+            if not title and not content:
+                continue
+            merged = (title + " " + content).lower()
+            if q_lower and q_lower not in merged:
+                continue
+            published_dt = self._parse_datetime(published_raw)
+            if published_dt is not None and published_dt < cutoff:
+                continue
+            results.append(
+                SearchResult(
+                    title=title or content[:50],
+                    snippet=(content[:500] or title[:500]),
+                    url=url,
+                    source="雪球",
+                    published_date=(published_dt.isoformat() if published_dt is not None else (str(published_raw) if published_raw else None)),
+                )
+            )
+            if len(results) >= max_results:
+                break
+
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=self._name,
+            success=True,
+            error_message=None,
+            search_time=time.time() - start_time,
+        )
+
+    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider=self._name,
+            success=False,
+            error_message="XueqiuNewsProvider 需通过 search_by_code(stock_code=...) 调用",
+        )
+
+
 class SearchService:
     """
     搜索服务
@@ -2205,8 +2691,37 @@ class SearchService:
         if anspire_keys:
             self._providers.insert(0, AnspireSearchProvider(anspire_keys))
             logger.info(f"已配置 Anspire Search 搜索，共 {len(anspire_keys)} 个 API Key")
-            
-        if not self._providers:
+
+        # 8. 中文 A 股专属 Provider（akshare 封装；本地数据源，无需 API Key）
+        self._cn_providers: List[_CodeAwareSearchProvider] = []
+        try:
+            em_provider = EastmoneyNewsProvider()
+            if em_provider.is_available:
+                self._cn_providers.append(em_provider)
+                logger.info("已启用 Eastmoney (东方财富) A 股新闻 Provider")
+        except Exception as e:
+            logger.debug("EastmoneyNewsProvider 初始化失败: %s", e)
+
+        try:
+            sina_provider = SinaFinanceNewsProvider()
+            if sina_provider.is_available:
+                self._cn_providers.append(sina_provider)
+                logger.info("已启用 SinaFinance (新浪财经/财联社) A 股新闻 Provider")
+        except Exception as e:
+            logger.debug("SinaFinanceNewsProvider 初始化失败: %s", e)
+
+        if os.getenv("ENABLE_XUEQIU_NEWS", "false").strip().lower() in ("1", "true", "yes", "on"):
+            try:
+                xq_provider = XueqiuNewsProvider()
+                if xq_provider.is_available:
+                    self._cn_providers.append(xq_provider)
+                    logger.info("已启用 Xueqiu (雪球) A 股新闻 Provider [实验性]")
+                else:
+                    logger.info("Xueqiu (雪球) Provider 不可用（akshare.stock_news_xq 缺失）")
+            except Exception as e:
+                logger.debug("XueqiuNewsProvider 初始化失败: %s", e)
+
+        if not self._providers and not self._cn_providers:
             logger.warning("未配置任何搜索能力，新闻搜索功能将不可用")
 
         # In-memory search result cache: {cache_key: (timestamp, SearchResponse)}
@@ -2340,6 +2855,113 @@ class SearchService:
     # A-share ETF code prefixes (Shanghai 51/52/56/58, Shenzhen 15/16/18)
     _A_ETF_PREFIXES = ('51', '52', '56', '58', '15', '16', '18')
     _ETF_NAME_KEYWORDS = ('ETF', 'FUND', 'TRUST', 'INDEX', 'TRACKER', 'UNIT')  # US/HK ETF name hints
+
+    # Tavily include_domains 白名单（A 股优先中文财经源，避免返回无关英文新闻）
+    _CN_FINANCE_DOMAINS: Tuple[str, ...] = (
+        "eastmoney.com",
+        "finance.eastmoney.com",
+        "xueqiu.com",
+        "10jqka.com.cn",
+        "finance.sina.com.cn",
+        "sina.com.cn",
+        "cls.cn",
+        "stcn.com",
+        "cnstock.com",
+        "jrj.com.cn",
+        "yicai.com",
+        "caixin.com",
+        "21jingji.com",
+        "cninfo.com.cn",
+        "sse.com.cn",
+        "szse.cn",
+    )
+
+    @staticmethod
+    def _is_a_share(stock_code: str) -> bool:
+        """A 股：6 位纯数字代码。"""
+        code = (stock_code or "").strip()
+        return code.isdigit() and len(code) == 6
+
+    def _select_providers_for_stock(
+        self,
+        stock_code: str,
+        stock_name: str,
+    ) -> List[BaseSearchProvider]:
+        """按股票市场对通用 Provider 做优先级重排序。
+
+        - A 股：优先 Bocha（中文语义优先），其余按原顺序
+        - 港股：优先 Bocha
+        - 美股：保持原顺序
+
+        说明：CN 专属 Provider（Eastmoney/Sina/Xueqiu）在 self._cn_providers 中独立管理，
+        不参与通用 Provider 的轮询；在 search_comprehensive_intel 中单独调度。
+        """
+        available = [p for p in self._providers if p.is_available]
+        if not available:
+            return []
+
+        is_foreign = self._is_foreign_stock(stock_code)
+        is_us = self._is_us_stock(stock_code)
+
+        # 美股：保持现状
+        if is_us:
+            return available
+
+        def _prio_key(p: BaseSearchProvider) -> Tuple[int, int]:
+            name = getattr(p, "name", "") or ""
+            if name == "Anspire":
+                return (0, available.index(p))
+            if name == "Bocha":
+                return (1, available.index(p))
+            return (2, available.index(p))
+
+        # A 股 / 港股：优先 Bocha、Anspire（中文搜索效果较好的引擎）
+        if self._is_a_share(stock_code) or is_foreign:
+            return sorted(available, key=_prio_key)
+
+        return available
+
+    def _fetch_cn_news_by_code(
+        self,
+        stock_code: str,
+        stock_name: str,
+        *,
+        query: str = "",
+        max_results: int = 5,
+        days: int = 7,
+    ) -> Optional[SearchResponse]:
+        """按 CN 专属 Provider 依次拉取新闻，返回首个成功且有结果的响应。
+
+        顺序：Eastmoney -> SinaFinance -> (Xueqiu, optional)
+        fail-open：全部失败时返回 None，调用方退回通用 Provider。
+        """
+        if not self._cn_providers:
+            return None
+
+        for provider in self._cn_providers:
+            try:
+                kwargs: Dict[str, Any] = {
+                    "stock_code": stock_code,
+                    "query": query,
+                    "max_results": max_results,
+                    "days": days,
+                }
+                if isinstance(provider, SinaFinanceNewsProvider):
+                    kwargs["stock_name"] = stock_name
+                resp = provider.search_by_code(**kwargs)
+            except Exception as e:
+                logger.debug("[CN Provider %s] search_by_code 异常: %s", provider.name, e)
+                continue
+            if resp is not None and resp.success and resp.results:
+                logger.info(
+                    "[CN Provider] %s 命中 %s(%s)，返回 %s 条",
+                    provider.name,
+                    stock_name,
+                    stock_code,
+                    len(resp.results),
+                )
+                return resp
+        return None
 
     @staticmethod
     def is_index_or_etf(stock_code: str, stock_name: str) -> bool:
@@ -2594,8 +3216,14 @@ class SearchService:
         search_days: int,
         max_results: int,
         log_scope: str,
+        require_chinese: bool = False,
     ) -> SearchResponse:
-        """Hard-filter results by published_date recency and normalize date strings."""
+        """Hard-filter results by published_date recency and normalize date strings.
+
+        Args:
+            require_chinese: 当为 True 时，过滤掉全英文（无 CJK 字符）的标题+摘要，
+                用于 A 股严格时效维度下避免 Tavily 等引擎返回无关英文新闻。
+        """
         if not response.success or not response.results:
             return response
 
@@ -2607,6 +3235,7 @@ class SearchService:
         dropped_unknown = 0
         dropped_old = 0
         dropped_future = 0
+        dropped_non_chinese = 0
 
         for item in response.results:
             published = self._normalize_news_publish_date(item.published_date)
@@ -2620,6 +3249,12 @@ class SearchService:
                 dropped_future += 1
                 continue
 
+            if require_chinese:
+                merged_text = " ".join(filter(None, [item.title, item.snippet]))
+                if not self._contains_chinese_text(merged_text):
+                    dropped_non_chinese += 1
+                    continue
+
             filtered.append(
                 SearchResult(
                     title=item.title,
@@ -2632,9 +3267,9 @@ class SearchService:
             if len(filtered) >= max_results:
                 break
 
-        if dropped_unknown or dropped_old or dropped_future:
+        if dropped_unknown or dropped_old or dropped_future or dropped_non_chinese:
             logger.info(
-                "[新闻过滤] %s: provider=%s, total=%s, kept=%s, drop_unknown=%s, drop_old=%s, drop_future=%s, window=[%s,%s]",
+                "[新闻过滤] %s: provider=%s, total=%s, kept=%s, drop_unknown=%s, drop_old=%s, drop_future=%s, drop_non_cn=%s, window=[%s,%s]",
                 log_scope,
                 response.provider,
                 len(response.results),
@@ -2642,6 +3277,7 @@ class SearchService:
                 dropped_unknown,
                 dropped_old,
                 dropped_future,
+                dropped_non_chinese,
                 earliest.isoformat(),
                 latest.isoformat(),
             )
@@ -3089,11 +3725,13 @@ class SearchService:
         search_days = self._effective_news_window_days()
         target_per_dimension = 3
         provider_max_results = self._provider_request_size(target_per_dimension)
+        is_a_share = self._is_a_share(stock_code) and not is_foreign
+        cn_dimensions_whitelist = {"latest_news", "announcements", "risk_check"}
 
         logger.info(
             (
                 "开始多维度情报搜索: %s(%s), 时间范围: 近%s天 "
-                "(profile=%s, NEWS_MAX_AGE_DAYS=%s), 目标条数=%s, provider请求条数=%s"
+                "(profile=%s, NEWS_MAX_AGE_DAYS=%s), 目标条数=%s, provider请求条数=%s, is_a_share=%s"
             ),
             stock_name,
             stock_code,
@@ -3102,31 +3740,80 @@ class SearchService:
             self.news_max_age_days,
             target_per_dimension,
             provider_max_results,
+            is_a_share,
         )
-        
+
+        # 按市场类型选择/重排序通用 Provider
+        selected_providers = self._select_providers_for_stock(stock_code, stock_name)
         # 轮流使用不同的搜索引擎
         provider_index = 0
-        
+
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
-            
-            # 选择搜索引擎（轮流使用）
-            available_providers = [p for p in self._providers if p.is_available]
+
+            # A 股：对新闻类维度先尝试 CN 专属 Provider（东方财富/新浪财经），命中即返回
+            if is_a_share and dim['name'] in cn_dimensions_whitelist and self._cn_providers:
+                cn_response = self._fetch_cn_news_by_code(
+                    stock_code,
+                    stock_name,
+                    query=stock_name,
+                    max_results=provider_max_results,
+                    days=search_days,
+                )
+                if cn_response is not None and cn_response.results:
+                    if dim['strict_freshness']:
+                        filtered_cn = self._filter_news_response(
+                            cn_response,
+                            search_days=search_days,
+                            max_results=target_per_dimension,
+                            log_scope=f"{stock_code}:{cn_response.provider}:{dim['name']}",
+                            require_chinese=True,
+                        )
+                    else:
+                        filtered_cn = self._normalize_and_limit_response(
+                            cn_response,
+                            max_results=target_per_dimension,
+                        )
+                    if filtered_cn.results:
+                        results[dim['name']] = filtered_cn
+                        search_count += 1
+                        logger.info(
+                            "[情报搜索][CN] %s: %s 命中，过滤后=%s 条",
+                            dim['desc'],
+                            cn_response.provider,
+                            len(filtered_cn.results),
+                        )
+                        time.sleep(0.2)
+                        continue
+                    logger.info(
+                        "[情报搜索][CN] %s: %s 过滤后无结果，回退到通用 Provider",
+                        dim['desc'],
+                        cn_response.provider,
+                    )
+
+            # 选择搜索引擎（按排序后列表轮流使用）
+            available_providers = selected_providers or [p for p in self._providers if p.is_available]
             if not available_providers:
                 break
-            
+
             provider = available_providers[provider_index % len(available_providers)]
             provider_index += 1
-            
+
             logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
 
             if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
+                tavily_kwargs: Dict[str, Any] = {
+                    "topic": dim['tavily_topic'],
+                }
+                # A 股：Tavily 限定在中文财经域名白名单内，避免返回无关英文新闻
+                if is_a_share:
+                    tavily_kwargs["include_domains"] = list(self._CN_FINANCE_DOMAINS)
                 response = provider.search(
                     dim['query'],
                     max_results=provider_max_results,
                     days=search_days,
-                    topic=dim['tavily_topic'],
+                    **tavily_kwargs,
                 )
             else:
                 response = provider.search(
@@ -3140,6 +3827,7 @@ class SearchService:
                     search_days=search_days,
                     max_results=target_per_dimension,
                     log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
+                    require_chinese=is_a_share,
                 )
             else:
                 filtered_response = self._normalize_and_limit_response(

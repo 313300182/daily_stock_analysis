@@ -131,6 +131,7 @@ class TrendAnalysisResult:
     signal_score: int = 0            # 综合评分 0-100
     signal_reasons: List[str] = field(default_factory=list)
     risk_factors: List[str] = field(default_factory=list)
+    neutral_observations: List[str] = field(default_factory=list)  # 中性/弱势观察，不纳入买入理由也不纳入风险
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -155,6 +156,7 @@ class TrendAnalysisResult:
             'signal_score': self.signal_score,
             'signal_reasons': self.signal_reasons,
             'risk_factors': self.risk_factors,
+            'neutral_observations': self.neutral_observations,
             'macd_dif': self.macd_dif,
             'macd_dea': self.macd_dea,
             'macd_bar': self.macd_bar,
@@ -532,10 +534,10 @@ class StockTrendAnalyzer:
             result.macd_signal = "⚠️ DIF下穿零轴，趋势转弱"
         elif result.macd_dif > 0 and result.macd_dea > 0:
             result.macd_status = MACDStatus.BULLISH
-            result.macd_signal = "✓ 多头排列，持续上涨"
+            result.macd_signal = "✓ MACD 多头区域，持续上涨"
         elif result.macd_dif < 0 and result.macd_dea < 0:
             result.macd_status = MACDStatus.BEARISH
-            result.macd_signal = "⚠ 空头排列，持续下跌"
+            result.macd_signal = "⚠ MACD 空头区域，持续下跌"
         else:
             result.macd_status = MACDStatus.BULLISH
             result.macd_signal = " MACD 中性区域"
@@ -595,6 +597,7 @@ class StockTrendAnalyzer:
         score = 0
         reasons = []
         risks = []
+        neutrals: List[str] = []  # 中性观察，不纳入买入理由也不纳入风险
 
         # === 趋势评分（30分）===
         trend_scores = {
@@ -699,12 +702,16 @@ class StockTrendAnalyzer:
         macd_score = macd_scores.get(result.macd_status, 5)
         score += macd_score
 
-        if result.macd_status in [MACDStatus.GOLDEN_CROSS_ZERO, MACDStatus.GOLDEN_CROSS]:
+        if result.macd_status in [MACDStatus.GOLDEN_CROSS_ZERO, MACDStatus.GOLDEN_CROSS, MACDStatus.CROSSING_UP]:
             reasons.append(f"✅ {result.macd_signal}")
+        elif result.macd_status == MACDStatus.BULLISH:
+            reasons.append(result.macd_signal)
         elif result.macd_status in [MACDStatus.DEATH_CROSS, MACDStatus.CROSSING_DOWN]:
             risks.append(f"⚠️ {result.macd_signal}")
+        elif result.macd_status == MACDStatus.BEARISH:
+            risks.append(result.macd_signal)
         else:
-            reasons.append(result.macd_signal)
+            neutrals.append(result.macd_signal)
 
         # === RSI 评分（10分）===
         rsi_scores = {
@@ -722,12 +729,13 @@ class StockTrendAnalyzer:
         elif result.rsi_status == RSIStatus.OVERBOUGHT:
             risks.append(f"⚠️ {result.rsi_signal}")
         else:
-            reasons.append(result.rsi_signal)
+            neutrals.append(result.rsi_signal)
 
         # === 综合判断 ===
         result.signal_score = score
         result.signal_reasons = reasons
         result.risk_factors = risks
+        result.neutral_observations = neutrals
 
         # 生成买入信号（调整阈值以适应新的100分制）
         if score >= 75 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
@@ -797,6 +805,12 @@ class StockTrendAnalyzer:
             lines.append(f"⚠️ 风险因素:")
             for risk in result.risk_factors:
                 lines.append(f"   {risk}")
+
+        if result.neutral_observations:
+            lines.append(f"")
+            lines.append(f"ℹ️ 中性观察:")
+            for obs in result.neutral_observations:
+                lines.append(f"   {obs}")
 
         return "\n".join(lines)
 

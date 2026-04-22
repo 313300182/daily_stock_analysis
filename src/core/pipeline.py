@@ -25,7 +25,7 @@ import pandas as pd
 from src.config import get_config, Config
 from src.storage import get_db
 from data_provider import DataFetcherManager
-from data_provider.base import normalize_stock_code
+from data_provider.base import normalize_stock_code, _is_etf_code
 from data_provider.realtime_types import ChipDistribution
 from src.analyzer import GeminiAnalyzer, AnalysisResult, fill_chip_structure_if_needed, fill_price_position_if_needed
 from src.data.stock_mapping import STOCK_NAME_MAP
@@ -318,7 +318,7 @@ class StockAnalysisPipeline:
             try:
                 fundamental_context = self.fetcher_manager.get_fundamental_context(
                     code,
-                    budget_seconds=getattr(self.config, 'fundamental_stage_timeout_seconds', 1.5),
+                    budget_seconds=getattr(self.config, 'fundamental_stage_timeout_seconds', 6.0),
                 )
             except Exception as e:
                 logger.warning(f"{stock_name}({code}) 基本面聚合失败: {e}")
@@ -355,11 +355,13 @@ class StockAnalysisPipeline:
 
             # Step 3: 趋势分析（基于交易理念）— 在 Agent 分支之前执行，供两条路径共用
             trend_result: Optional[TrendAnalysisResult] = None
+            historical_bar_count = 0
             try:
                 _mkt = get_market_for_stock(normalize_stock_code(code))
                 end_date = get_market_now(_mkt).date()
                 start_date = end_date - timedelta(days=89)  # ~60 trading days for MA60
                 historical_bars = self.db.get_data_range(code, start_date, end_date)
+                historical_bar_count = len(historical_bars) if historical_bars else 0
                 if historical_bars:
                     df = pd.DataFrame([bar.to_dict() for bar in historical_bars])
                     # Issue #234: Augment with realtime for intraday MA calculation
@@ -466,6 +468,12 @@ class StockAnalysisPipeline:
                 stock_name,
                 fundamental_context,
                 commodity_context,
+            )
+            self._inject_data_warning(
+                enhanced_context, code, stock_name,
+                historical_bar_count=historical_bar_count,
+                trend_result=trend_result,
+                current_time=None,
             )
             
             # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
@@ -580,7 +588,7 @@ class StockAnalysisPipeline:
             try:
                 fundamental_context = self.fetcher_manager.get_fundamental_context(
                     code,
-                    budget_seconds=getattr(self.config, 'fundamental_stage_timeout_seconds', 1.5),
+                    budget_seconds=getattr(self.config, 'fundamental_stage_timeout_seconds', 6.0),
                 )
             except Exception as e:
                 fundamental_context = self.fetcher_manager.build_failed_fundamental_context(code, str(e))
@@ -593,11 +601,13 @@ class StockAnalysisPipeline:
                 pass
 
             trend_result = None
+            historical_bar_count = 0
             try:
                 _mkt = get_market_for_stock(normalize_stock_code(code))
                 end_date = get_market_now(_mkt).date()
                 start_date = end_date - timedelta(days=89)
                 historical_bars = self.db.get_data_range(code, start_date, end_date)
+                historical_bar_count = len(historical_bars) if historical_bars else 0
                 if historical_bars:
                     df = pd.DataFrame([bar.to_dict() for bar in historical_bars])
                     if self.config.enable_realtime_quote and realtime_quote:
@@ -632,6 +642,12 @@ class StockAnalysisPipeline:
                 context, realtime_quote, chip_data, trend_result,
                 stock_name, fundamental_context, commodity_context,
             )
+            self._inject_data_warning(
+                enhanced_context, code, stock_name,
+                historical_bar_count=historical_bar_count,
+                trend_result=trend_result,
+                current_time=current_time,
+            )
 
             system_prompt, user_prompt = self.analyzer.build_prompt(
                 enhanced_context, news_context=news_context
@@ -660,6 +676,65 @@ class StockAnalysisPipeline:
             logger.error(f"{stock_name}({code}) Prompt 导出失败: {e}")
             logger.exception(f"{stock_name}({code}) 详细错误信息:")
             return None
+
+    def _inject_data_warning(
+        self,
+        enhanced_context: Dict[str, Any],
+        code: str,
+        stock_name: str,
+        historical_bar_count: int,
+        trend_result: Optional[TrendAnalysisResult],
+        current_time: Optional[datetime] = None,
+    ) -> None:
+        """
+        在 Prompt 前注入数据质量提示。
+
+        场景：
+        - 非交易日：标注今日非交易日 + 最后交易日
+        - 历史 K 线为 0：数据源失联
+        - 历史 K 线 <20：MA/趋势判断失真
+        - ETF + MA5/10/20 完全一致：行情源疑似未更新
+        """
+        warnings: List[str] = []
+        try:
+            _nmk = get_market_for_stock(normalize_stock_code(code))
+            _today_dt = get_market_now(_nmk).date()
+            if _nmk and not is_market_open(_nmk, _today_dt):
+                _last_td = get_effective_trading_date(_nmk, current_time=current_time)
+                warnings.append(
+                    f"ℹ️ 今日（{_today_dt.isoformat()}）非 {_nmk.upper()} 交易日，以下数据截至最后交易日 {_last_td.isoformat()}"
+                )
+        except Exception as e:
+            logger.debug(f"{stock_name}({code}) 判断非交易日失败: {e}")
+
+        is_etf = False
+        try:
+            is_etf = _is_etf_code(code)
+        except Exception:
+            is_etf = False
+
+        if historical_bar_count == 0:
+            warnings.append(
+                "⚠️ 历史 K 线数据为 0（数据源可能失联或本地缓存为空），技术面判断不可靠"
+            )
+        elif historical_bar_count < 20:
+            warnings.append(
+                f"⚠️ 历史数据不足（仅 {historical_bar_count} 根 K 线），MA20/趋势判断可能失真，请谨慎参考"
+            )
+        elif is_etf and trend_result is not None:
+            ma5 = getattr(trend_result, 'ma5', 0) or 0
+            ma10 = getattr(trend_result, 'ma10', 0) or 0
+            ma20 = getattr(trend_result, 'ma20', 0) or 0
+            if ma5 and ma10 and ma20 and abs(ma5 - ma10) < 1e-6 and abs(ma10 - ma20) < 1e-6:
+                warnings.append(
+                    "⚠️ ETF 均线 MA5/MA10/MA20 数值完全一致，疑似行情源未更新，请核对最新交易日"
+                )
+
+        if warnings:
+            existing = enhanced_context.get('data_warning') or []
+            if isinstance(existing, str):
+                existing = [existing]
+            enhanced_context['data_warning'] = list(existing) + warnings
 
     def _enhance_context(
         self,
@@ -744,6 +819,7 @@ class StockAnalysisPipeline:
                 'signal_score': trend_result.signal_score,
                 'signal_reasons': trend_result.signal_reasons,
                 'risk_factors': trend_result.risk_factors,
+                'neutral_observations': getattr(trend_result, 'neutral_observations', []),
             }
 
         # Issue #234: Override today with realtime OHLC + trend MA for intraday analysis

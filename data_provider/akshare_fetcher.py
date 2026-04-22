@@ -545,42 +545,58 @@ class AkshareFetcher(BaseFetcher):
         
         logger.info(f"[API调用] ak.fund_etf_hist_em(symbol={stock_code}, period=daily, "
                    f"start_date={start_date.replace('-', '')}, end_date={end_date.replace('-', '')}, adjust=qfq)")
-        
-        try:
-            import time as _time
-            api_start = _time.time()
-            
-            # 调用 akshare 获取 ETF 日线数据
-            df = ak.fund_etf_hist_em(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date.replace('-', ''),
-                end_date=end_date.replace('-', ''),
-                adjust="qfq"  # 前复权
-            )
-            
-            api_elapsed = _time.time() - api_start
-            
-            # 记录返回数据摘要
-            if df is not None and not df.empty:
-                logger.info(f"[API返回] ak.fund_etf_hist_em 成功: 返回 {len(df)} 行数据, 耗时 {api_elapsed:.2f}s")
-                logger.info(f"[API返回] 列名: {list(df.columns)}")
-                logger.info(f"[API返回] 日期范围: {df['日期'].iloc[0]} ~ {df['日期'].iloc[-1]}")
-                logger.debug(f"[API返回] 最新3条数据:\n{df.tail(3).to_string()}")
-            else:
-                logger.warning(f"[API返回] ak.fund_etf_hist_em 返回空数据, 耗时 {api_elapsed:.2f}s")
-            
-            return df
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            
-            # 检测反爬封禁
-            if any(keyword in error_msg for keyword in ['banned', 'blocked', '频率', 'rate', '限制']):
-                logger.warning(f"检测到可能被封禁: {e}")
-                raise RateLimitError(f"Akshare 可能被限流: {e}") from e
-            
-            raise DataFetchError(f"Akshare 获取 ETF 数据失败: {e}") from e
+
+        import time as _time
+        retry_delays = [0.0, 0.5, 1.5]  # 首次 + 2 次退避重试（覆盖 RemoteDisconnected）
+        last_exc: Optional[Exception] = None
+        for attempt, delay in enumerate(retry_delays):
+            if delay > 0:
+                logger.warning(
+                    f"[重试{attempt}/{len(retry_delays)-1}] ak.fund_etf_hist_em(symbol={stock_code}) "
+                    f"上次失败({type(last_exc).__name__ if last_exc else '?'})，{delay}s 后重试"
+                )
+                _time.sleep(delay)
+            try:
+                api_start = _time.time()
+                df = ak.fund_etf_hist_em(
+                    symbol=stock_code,
+                    period="daily",
+                    start_date=start_date.replace('-', ''),
+                    end_date=end_date.replace('-', ''),
+                    adjust="qfq",
+                )
+                api_elapsed = _time.time() - api_start
+
+                if df is not None and not df.empty:
+                    logger.info(f"[API返回] ak.fund_etf_hist_em 成功: 返回 {len(df)} 行数据, 耗时 {api_elapsed:.2f}s")
+                    logger.info(f"[API返回] 列名: {list(df.columns)}")
+                    logger.info(f"[API返回] 日期范围: {df['日期'].iloc[0]} ~ {df['日期'].iloc[-1]}")
+                    logger.debug(f"[API返回] 最新3条数据:\n{df.tail(3).to_string()}")
+                else:
+                    logger.warning(f"[API返回] ak.fund_etf_hist_em 返回空数据, 耗时 {api_elapsed:.2f}s")
+
+                return df
+
+            except Exception as e:
+                last_exc = e
+                error_msg = str(e).lower()
+
+                if any(keyword in error_msg for keyword in ['banned', 'blocked', '频率', 'rate', '限制']):
+                    logger.warning(f"检测到可能被封禁: {e}")
+                    raise RateLimitError(f"Akshare 可能被限流: {e}") from e
+
+                is_transient = (
+                    'remotedisconnected' in error_msg
+                    or 'connection' in error_msg
+                    or 'timeout' in error_msg
+                    or 'timed out' in error_msg
+                    or 'reset' in error_msg
+                )
+                if is_transient and attempt < len(retry_delays) - 1:
+                    continue
+                raise DataFetchError(f"Akshare 获取 ETF 数据失败: {e}") from e
+
+        raise DataFetchError(f"Akshare 获取 ETF 数据失败: {last_exc}") from last_exc
     
     def _fetch_us_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """

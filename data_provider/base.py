@@ -899,6 +899,26 @@ class DataFetcherManager:
         with self._fetchers_lock:
             self._fetchers.append(fetcher)
             self._fetchers.sort(key=lambda f: f.priority)
+
+    @staticmethod
+    def _order_fetchers_by_name(
+        fetchers: List[BaseFetcher],
+        preferred_names: List[str],
+        *,
+        include_remaining: bool = True,
+    ) -> List[BaseFetcher]:
+        """按给定名称顺序重排 fetcher，并可选择追加剩余项。"""
+        name_to_fetcher: Dict[str, BaseFetcher] = {f.name: f for f in fetchers}
+        ordered: List[BaseFetcher] = []
+        for name in preferred_names:
+            fetcher = name_to_fetcher.get(name)
+            if fetcher is not None and fetcher not in ordered:
+                ordered.append(fetcher)
+        if include_remaining:
+            for fetcher in fetchers:
+                if fetcher not in ordered:
+                    ordered.append(fetcher)
+        return ordered
     
     def get_daily_data(
         self, 
@@ -997,6 +1017,21 @@ class DataFetcherManager:
             logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
             raise DataFetchError(error_summary)
 
+        if is_hk:
+            prefer_lb = self._longbridge_preferred()
+            hk_order = (
+                ["LongbridgeFetcher", "AkshareFetcher", "YfinanceFetcher"]
+                if prefer_lb
+                else ["AkshareFetcher", "LongbridgeFetcher", "YfinanceFetcher"]
+            )
+            fetchers = self._order_fetchers_by_name(fetchers, hk_order, include_remaining=False)
+            logger.info("[数据源路由] 港股 %s 使用专用顺序: %s", stock_code, ",".join([f.name for f in fetchers]))
+        elif _is_etf_code(stock_code):
+            etf_order = ["AkshareFetcher", "EfinanceFetcher", "TushareFetcher", "YfinanceFetcher", "LongbridgeFetcher"]
+            fetchers = self._order_fetchers_by_name(fetchers, etf_order, include_remaining=False)
+            logger.info("[数据源路由] ETF %s 使用专用顺序: %s", stock_code, ",".join([f.name for f in fetchers]))
+
+        total_fetchers = len(fetchers)
         for attempt, fetcher in enumerate(fetchers, start=1):
             try:
                 logger.info(f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] 获取 {stock_code}...")
@@ -1482,13 +1517,31 @@ class DataFetcherManager:
             return self._cache_stock_name(stock_code, static_name) or static_name
 
         # 3. 依次尝试各个数据源
-        from .akshare_fetcher import _is_us_code
-        is_us = _is_us_code(stock_code)
-        _US_CAPABLE_FETCHERS = {"YfinanceFetcher", "LongbridgeFetcher"}
-        for fetcher in self._get_fetchers_snapshot():
+        market = _market_tag(stock_code)
+        is_etf = _is_etf_code(stock_code)
+        fetchers = self._get_fetchers_snapshot()
+        if market == "us":
+            prefer_lb = self._longbridge_preferred()
+            us_order = (
+                ["LongbridgeFetcher", "YfinanceFetcher"]
+                if prefer_lb
+                else ["YfinanceFetcher", "LongbridgeFetcher"]
+            )
+            fetchers = self._order_fetchers_by_name(fetchers, us_order, include_remaining=False)
+        elif market == "hk":
+            prefer_lb = self._longbridge_preferred()
+            hk_order = (
+                ["LongbridgeFetcher", "AkshareFetcher", "YfinanceFetcher"]
+                if prefer_lb
+                else ["AkshareFetcher", "LongbridgeFetcher", "YfinanceFetcher"]
+            )
+            fetchers = self._order_fetchers_by_name(fetchers, hk_order, include_remaining=False)
+        elif is_etf:
+            etf_order = ["AkshareFetcher", "EfinanceFetcher", "TushareFetcher", "YfinanceFetcher", "LongbridgeFetcher"]
+            fetchers = self._order_fetchers_by_name(fetchers, etf_order, include_remaining=False)
+
+        for fetcher in fetchers:
             if not hasattr(fetcher, 'get_stock_name'):
-                continue
-            if is_us and fetcher.name not in _US_CAPABLE_FETCHERS:
                 continue
             try:
                 name = self._call_fetcher_method(fetcher, 'get_stock_name', stock_code)

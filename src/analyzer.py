@@ -1509,8 +1509,20 @@ class GeminiAnalyzer:
         no_data_text = get_no_data_text(report_language)
         
         # ========== 构建决策仪表盘格式的输入 ==========
-        prompt = f"""# 决策仪表盘分析请求
+        data_warning_block = ""
+        _dw = context.get('data_warning') if isinstance(context, dict) else None
+        if _dw:
+            if isinstance(_dw, str):
+                _dw_list = [_dw]
+            elif isinstance(_dw, (list, tuple)):
+                _dw_list = [str(x) for x in _dw if x]
+            else:
+                _dw_list = []
+            if _dw_list:
+                data_warning_block = "\n> **数据质量提示**：\n" + "\n".join(f"> {line}" for line in _dw_list) + "\n"
 
+        prompt = f"""# 决策仪表盘分析请求
+{data_warning_block}
 ## 📊 股票基础信息
 | 项目 | 数据 |
 |------|------|
@@ -1539,7 +1551,7 @@ class GeminiAnalyzer:
 | MA5 | {today.get('ma5', 'N/A')} | 短期趋势线 |
 | MA10 | {today.get('ma10', 'N/A')} | 中短期趋势线 |
 | MA20 | {today.get('ma20', 'N/A')} | 中期趋势线 |
-| 均线形态 | {context.get('ma_status', unknown_text)} | 多头/空头/缠绕 |
+| 均线形态（含价格位置） | {context.get('ma_status', unknown_text)} | 以 close vs MA 综合判断，非单纯均线相对位置 |
 """
         
         # 添加实时行情数据（量比、换手率等）
@@ -1581,28 +1593,46 @@ class GeminiAnalyzer:
             if isinstance(earnings_data, dict)
             else {}
         )
-        if isinstance(financial_report, dict) or isinstance(dividend_metrics, dict):
-            financial_report = financial_report if isinstance(financial_report, dict) else {}
-            dividend_metrics = dividend_metrics if isinstance(dividend_metrics, dict) else {}
-            ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
-            ttm_cash = dividend_metrics.get("ttm_cash_dividend_per_share", "N/A")
-            ttm_count = dividend_metrics.get("ttm_event_count", "N/A")
-            report_date = financial_report.get("report_date", "N/A")
-            prompt += f"""
-### 财报与分红（价值投资口径）
-| 指标 | 数值 | 说明 |
-|------|------|------|
-| 最近报告期 | {report_date} | 来自结构化财报字段 |
-| 营业收入 | {financial_report.get('revenue', 'N/A')} | |
-| 归母净利润 | {financial_report.get('net_profit_parent', 'N/A')} | |
-| 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | |
-| ROE | {financial_report.get('roe', 'N/A')} | |
-| 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径 |
-| TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |
-| TTM 分红事件数 | {ttm_count} | |
-
-> 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。
-"""
+        financial_report = financial_report if isinstance(financial_report, dict) else {}
+        dividend_metrics = dividend_metrics if isinstance(dividend_metrics, dict) else {}
+        has_financial = self._has_any_value(financial_report)
+        has_dividend = self._has_any_value(dividend_metrics)
+        if has_financial or has_dividend:
+            lines: List[str] = ["", "### 财报与分红（价值投资口径）", "| 指标 | 数值 | 说明 |", "|------|------|------|"]
+            if has_financial:
+                report_date = financial_report.get("report_date", "N/A")
+                lines.extend([
+                    f"| 最近报告期 | {report_date} | 来自结构化财报字段 |",
+                    f"| 营业收入 | {financial_report.get('revenue', 'N/A')} | |",
+                    f"| 归母净利润 | {financial_report.get('net_profit_parent', 'N/A')} | |",
+                    f"| 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | |",
+                    f"| ROE | {financial_report.get('roe', 'N/A')} | |",
+                ])
+            else:
+                lines.append("| 财报数据 | 未获取到 | 数据源可能超时或暂未接通 |")
+            if has_dividend:
+                ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
+                ttm_cash = dividend_metrics.get("ttm_cash_dividend_per_share", "N/A")
+                ttm_count = dividend_metrics.get("ttm_event_count", "N/A")
+                lines.extend([
+                    f"| 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径 |",
+                    f"| TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |",
+                    f"| TTM 分红事件数 | {ttm_count} | |",
+                ])
+            else:
+                lines.append("| 分红数据 | 未获取到 | 数据源可能超时或暂未接通 |")
+            lines.append("")
+            lines.append("> 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。")
+            prompt += "\n".join(lines) + "\n"
+        else:
+            prompt += (
+                "\n### 财报与分红（价值投资口径）\n"
+                "> ⚠️ 财报 / 分红数据未获取到（可能网络抖动、接口超时或本地缓存为空）。\n"
+                "> 建议：\n"
+                "> 1. 调高 `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS`（默认 6.0，可尝试 10.0）\n"
+                "> 2. 检查 AkShare / 同花顺等接口是否被网络阻断\n"
+                "> 3. 本次分析请跳过价值投资评分，不得编造数值。\n"
+            )
 
         # 添加筹码分布数据
         if 'chip' in context:
@@ -1629,7 +1659,7 @@ class GeminiAnalyzer:
 | 指标 | 数值 | 判定 |
 |------|------|------|
 | 趋势状态 | {trend.get('trend_status', unknown_text)} | |
-| 均线排列 | {trend.get('ma_alignment', unknown_text)} | MA5>MA10>MA20为多头 |
+| 均线排列（仅均线相对位置） | {trend.get('ma_alignment', unknown_text)} | MA5>MA10>MA20 为多头；不含价格位置 |
 | 趋势强度 | {trend.get('trend_strength', 0)}/100 | |
 | **乖离率(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
 | 乖离率(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
@@ -1643,6 +1673,9 @@ class GeminiAnalyzer:
 
 **风险因素**：
 {chr(10).join('- ' + r for r in trend.get('risk_factors', ['无'])) if trend.get('risk_factors') else '- 无'}
+
+**中性观察**：
+{chr(10).join('- ' + r for r in trend.get('neutral_observations', [])) if trend.get('neutral_observations') else '- 无'}
 """
             else:
                 bias_warning = (
@@ -1655,7 +1688,7 @@ class GeminiAnalyzer:
 | 指标 | 数值 | 说明 |
 |------|------|------|
 | 趋势状态 | {trend.get('trend_status', unknown_text)} | |
-| 均线排列 | {trend.get('ma_alignment', unknown_text)} | 结合激活技能判断结构强弱 |
+| 均线排列（仅均线相对位置） | {trend.get('ma_alignment', unknown_text)} | MA5>MA10>MA20 为多头；结合激活技能判断结构强弱 |
 | 趋势强度 | {trend.get('trend_strength', 0)}/100 | |
 | **价格位置(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
 | 价格位置(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
@@ -1669,6 +1702,9 @@ class GeminiAnalyzer:
 
 **风险因素**：
 {chr(10).join('- ' + r for r in trend.get('risk_factors', ['无'])) if trend.get('risk_factors') else '- 无'}
+
+**中性观察**：
+{chr(10).join('- ' + r for r in trend.get('neutral_observations', [])) if trend.get('neutral_observations') else '- 无'}
 """
         
         # 关联商品行情（资源类股票增强，非资源股自动跳过）
@@ -1834,6 +1870,28 @@ class GeminiAnalyzer:
         
         return prompt
     
+    @staticmethod
+    def _has_any_value(d: Optional[Dict[str, Any]]) -> bool:
+        """判断 dict 是否至少有一个有效（非 None / 非 'N/A' / 非空字符串）字段。"""
+        if not isinstance(d, dict) or not d:
+            return False
+        for v in d.values():
+            if v is None:
+                continue
+            if isinstance(v, str):
+                _s = v.strip()
+                if not _s or _s.upper() in ("N/A", "NA", "-", "--"):
+                    continue
+                return True
+            if isinstance(v, (int, float)):
+                if v == 0:
+                    # 0 通常无意义，但某些字段 0 有效，这里保守当做有效
+                    return True
+                return True
+            if isinstance(v, (list, tuple, dict)) and v:
+                return True
+        return False
+
     def _format_volume(self, volume: Optional[float]) -> str:
         """格式化成交量显示"""
         if volume is None:
