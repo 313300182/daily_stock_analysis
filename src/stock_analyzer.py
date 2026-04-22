@@ -126,6 +126,44 @@ class TrendAnalysisResult:
     rsi_status: RSIStatus = RSIStatus.NEUTRAL
     rsi_signal: str = ""              # RSI 信号描述
 
+    # === 长周期均线 ===
+    ma30: float = 0.0
+    ma120: float = 0.0
+    ma250: float = 0.0
+
+    # === 长周期均线乖离率（百分比）===
+    bias_ma30: float = 0.0
+    bias_ma60: float = 0.0
+    bias_ma120: float = 0.0
+    bias_ma250: float = 0.0
+
+    # === 斐波那契回撤 ===
+    fib_peak: float = 0.0
+    fib_peak_date: str = ""
+    fib_trough: float = 0.0
+    fib_trough_date: str = ""
+    fib_0236: float = 0.0
+    fib_0382: float = 0.0
+    fib_0500: float = 0.0
+    fib_0618: float = 0.0
+    fib_0786: float = 0.0
+    fib_current_position: str = ""
+
+    # === 历史高低点 ===
+    high_60d: float = 0.0
+    low_60d: float = 0.0
+    high_120d: float = 0.0
+    low_120d: float = 0.0
+    high_250d: float = 0.0
+    low_250d: float = 0.0
+
+    # === 波动率指标 ===
+    atr_14: float = 0.0              # 14日真实波幅均值
+    atr_pct: float = 0.0              # ATR 占当前价百分比
+    hv_20: float = 0.0                # 20日年化历史波动率（%）
+    hv_60: float = 0.0                # 60日年化历史波动率（%）
+    volatility_level: str = ""        # 低/中/高/极高
+
     # 买入信号
     buy_signal: BuySignal = BuySignal.WAIT
     signal_score: int = 0            # 综合评分 0-100
@@ -167,6 +205,34 @@ class TrendAnalysisResult:
             'rsi_24': self.rsi_24,
             'rsi_status': self.rsi_status.value,
             'rsi_signal': self.rsi_signal,
+            'ma30': self.ma30,
+            'ma120': self.ma120,
+            'ma250': self.ma250,
+            'bias_ma30': self.bias_ma30,
+            'bias_ma60': self.bias_ma60,
+            'bias_ma120': self.bias_ma120,
+            'bias_ma250': self.bias_ma250,
+            'fib_peak': self.fib_peak,
+            'fib_peak_date': self.fib_peak_date,
+            'fib_trough': self.fib_trough,
+            'fib_trough_date': self.fib_trough_date,
+            'fib_0236': self.fib_0236,
+            'fib_0382': self.fib_0382,
+            'fib_0500': self.fib_0500,
+            'fib_0618': self.fib_0618,
+            'fib_0786': self.fib_0786,
+            'fib_current_position': self.fib_current_position,
+            'high_60d': self.high_60d,
+            'low_60d': self.low_60d,
+            'high_120d': self.high_120d,
+            'low_120d': self.low_120d,
+            'high_250d': self.high_250d,
+            'low_250d': self.low_250d,
+            'atr_14': self.atr_14,
+            'atr_pct': self.atr_pct,
+            'hv_20': self.hv_20,
+            'hv_60': self.hv_60,
+            'volatility_level': self.volatility_level,
         }
 
 
@@ -240,6 +306,19 @@ class StockTrendAnalyzer:
         result.ma20 = float(latest['MA20'])
         result.ma60 = float(latest.get('MA60', 0))
 
+        if 'MA30' in df.columns and pd.notna(latest.get('MA30')):
+            result.ma30 = float(latest['MA30'])
+        if 'MA120' in df.columns and pd.notna(latest.get('MA120')):
+            result.ma120 = float(latest['MA120'])
+        if 'MA250' in df.columns and pd.notna(latest.get('MA250')):
+            result.ma250 = float(latest['MA250'])
+
+        self._calculate_long_ma_bias(df, result)
+        self._calculate_period_highlow(df, result)
+        self._calculate_fibonacci(df, result, lookback=120)
+        self._calculate_atr(df, result, period=14)
+        self._calculate_hv(df, result)
+
         # 1. 趋势判断
         self._analyze_trend(df, result)
 
@@ -264,15 +343,21 @@ class StockTrendAnalyzer:
         return result
     
     def _calculate_mas(self, df: pd.DataFrame) -> pd.DataFrame:
-        """计算均线"""
+        """计算全周期均线（MA5/10/20/30/60/120/250）"""
         df = df.copy()
         df['MA5'] = df['close'].rolling(window=5).mean()
         df['MA10'] = df['close'].rolling(window=10).mean()
         df['MA20'] = df['close'].rolling(window=20).mean()
+        if len(df) >= 30:
+            df['MA30'] = df['close'].rolling(window=30).mean()
         if len(df) >= 60:
             df['MA60'] = df['close'].rolling(window=60).mean()
         else:
-            df['MA60'] = df['MA20']  # 数据不足时使用 MA20 替代
+            df['MA60'] = df['MA20']  # 数据不足时使用 MA20 替代（保留旧语义）
+        if len(df) >= 120:
+            df['MA120'] = df['close'].rolling(window=120).mean()
+        if len(df) >= 250:
+            df['MA250'] = df['close'].rolling(window=250).mean()
         return df
 
     def _calculate_macd(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -337,7 +422,183 @@ class StockTrendAnalyzer:
             df[col_name] = rsi
 
         return df
-    
+
+    def _calculate_long_ma_bias(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+        """计算长周期均线乖离率
+
+        bias = (current_price - maN) / maN * 100
+        仅在对应 maN > 0 时写入，否则保持默认 0。
+        """
+        if df is None or df.empty:
+            return
+        current_price = float(df['close'].iloc[-1])
+        if current_price <= 0:
+            return
+        for period in (30, 60, 120, 250):
+            ma_value = getattr(result, f'ma{period}', 0.0)
+            if ma_value and ma_value > 0:
+                bias = (current_price - ma_value) / ma_value * 100
+                setattr(result, f'bias_ma{period}', float(bias))
+
+    def _calculate_fibonacci(
+        self,
+        df: pd.DataFrame,
+        result: TrendAnalysisResult,
+        lookback: int = 120,
+    ) -> None:
+        """计算斐波那契回撤位
+
+        策略：
+        - 在最近 lookback 日窗口内找最高点 peak（high.idxmax）
+        - 在 peak 之前找最低点 trough（low.idxmin），构成"上涨段"
+        - 若 peak_price <= trough_price 或 peak 为窗口首个样本，放弃计算
+        - 计算 0.236 / 0.382 / 0.5 / 0.618 / 0.786 五档回撤价
+        - 根据当前收盘价在哪档之上给出位置描述
+        """
+        if df is None or len(df) < 30:
+            return
+
+        recent = df.tail(lookback).copy()
+        if recent.empty:
+            return
+
+        peak_idx = recent['high'].idxmax()
+        peak_pos = recent.index.get_loc(peak_idx)
+        if peak_pos == 0:
+            return
+
+        before_peak = recent.iloc[:peak_pos + 1]
+        trough_idx = before_peak['low'].idxmin()
+
+        peak_price = float(recent.loc[peak_idx, 'high'])
+        trough_price = float(recent.loc[trough_idx, 'low'])
+
+        if peak_price <= trough_price:
+            return
+
+        diff = peak_price - trough_price
+
+        result.fib_peak = peak_price
+        result.fib_trough = trough_price
+
+        def _fmt_date(row_value: Any) -> str:
+            if row_value is None:
+                return ""
+            try:
+                return str(row_value)[:10]
+            except Exception:
+                return ""
+
+        try:
+            peak_date_val = recent.loc[peak_idx].get('date', peak_idx)
+        except Exception:
+            peak_date_val = peak_idx
+        try:
+            trough_date_val = recent.loc[trough_idx].get('date', trough_idx)
+        except Exception:
+            trough_date_val = trough_idx
+
+        result.fib_peak_date = _fmt_date(peak_date_val)
+        result.fib_trough_date = _fmt_date(trough_date_val)
+
+        result.fib_0236 = peak_price - diff * 0.236
+        result.fib_0382 = peak_price - diff * 0.382
+        result.fib_0500 = peak_price - diff * 0.5
+        result.fib_0618 = peak_price - diff * 0.618
+        result.fib_0786 = peak_price - diff * 0.786
+
+        current = float(df['close'].iloc[-1])
+        if current >= result.fib_0236:
+            result.fib_current_position = "强势/未显著回调(>0.236)"
+        elif current >= result.fib_0382:
+            result.fib_current_position = "浅回调(0.236~0.382)"
+        elif current >= result.fib_0500:
+            result.fib_current_position = "中等回调(0.382~0.5)"
+        elif current >= result.fib_0618:
+            result.fib_current_position = "深回调(0.5~0.618)"
+        elif current >= result.fib_0786:
+            result.fib_current_position = "深度回撤(0.618~0.786)"
+        else:
+            result.fib_current_position = "趋势破坏(<0.786)"
+
+    def _calculate_period_highlow(
+        self,
+        df: pd.DataFrame,
+        result: TrendAnalysisResult,
+    ) -> None:
+        """计算不同周期的历史高低点（60/120/250 日）"""
+        if df is None or df.empty:
+            return
+        for period in (60, 120, 250):
+            if len(df) >= period:
+                recent = df.tail(period)
+                setattr(result, f'high_{period}d', float(recent['high'].max()))
+                setattr(result, f'low_{period}d', float(recent['low'].min()))
+
+    def _calculate_atr(
+        self,
+        df: pd.DataFrame,
+        result: TrendAnalysisResult,
+        period: int = 14,
+    ) -> None:
+        """计算 Average True Range
+
+        TR = max(high-low, |high-prev_close|, |low-prev_close|)
+        ATR = TR 的 period 日简单移动平均
+        """
+        if df is None or len(df) < period + 1:
+            return
+
+        high = df['high']
+        low = df['low']
+        prev_close = df['close'].shift(1)
+
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean().iloc[-1]
+
+        if pd.notna(atr):
+            result.atr_14 = float(atr)
+            current_price = float(df['close'].iloc[-1])
+            if current_price > 0:
+                result.atr_pct = result.atr_14 / current_price * 100
+
+    def _calculate_hv(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+        """计算年化历史波动率
+
+        HV = std(log_return) * sqrt(250) * 100
+        并按 hv_20 分档：<25 低、<40 中、<60 高、>=60 极高
+        """
+        if df is None or len(df) < 21:
+            return
+
+        log_ret = np.log(df['close'] / df['close'].shift(1))
+
+        if len(df) >= 21:
+            hv20 = log_ret.tail(20).std() * np.sqrt(250) * 100
+            if pd.notna(hv20):
+                result.hv_20 = float(hv20)
+
+        if len(df) >= 61:
+            hv60 = log_ret.tail(60).std() * np.sqrt(250) * 100
+            if pd.notna(hv60):
+                result.hv_60 = float(hv60)
+
+        hv = result.hv_20
+        if hv <= 0:
+            result.volatility_level = "N/A"
+        elif hv < 25:
+            result.volatility_level = "低"
+        elif hv < 40:
+            result.volatility_level = "中"
+        elif hv < 60:
+            result.volatility_level = "高"
+        else:
+            result.volatility_level = "极高"
+
     def _analyze_trend(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """
         分析趋势状态

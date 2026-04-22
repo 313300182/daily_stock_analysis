@@ -1706,7 +1706,70 @@ class GeminiAnalyzer:
 **中性观察**：
 {chr(10).join('- ' + r for r in trend.get('neutral_observations', [])) if trend.get('neutral_observations') else '- 无'}
 """
-        
+
+            # === 🎯 技术锚点增强数据（Step 2 新增：长周期均线 / 斐波那契 / 高低点 / ATR / HV）===
+            # 能取到就填入，取不到统一渲染 N/A（短数据场景优雅降级）
+            has_long_ma = any(
+                trend.get(k, 0) for k in ('ma30', 'ma60', 'ma120', 'ma250')
+            )
+            has_fib = bool(trend.get('fib_peak', 0)) and bool(trend.get('fib_trough', 0))
+            has_highlow = any(
+                trend.get(k, 0) for k in ('high_60d', 'high_120d', 'high_250d')
+            )
+            has_atr = bool(trend.get('atr_14', 0))
+            has_hv = bool(trend.get('hv_20', 0)) or bool(trend.get('hv_60', 0))
+
+            if has_long_ma or has_fib or has_highlow or has_atr or has_hv:
+                atr_14_val = trend.get('atr_14', 0) or 0
+                try:
+                    atr_stop_dist = f"{float(atr_14_val) * 2:.2f}" if atr_14_val else 'N/A'
+                except (TypeError, ValueError):
+                    atr_stop_dist = 'N/A'
+
+                prompt += f"""
+### 🎯 技术锚点增强数据（精确决策用）
+
+#### 长周期均线（判断中长期趋势位置）
+| 均线 | 数值 | 价格相对位置 |
+|------|------|--------------|
+| MA30  | {self._fmt_num(trend.get('ma30'))} | {self._format_bias(trend.get('bias_ma30'))} |
+| MA60  | {self._fmt_num(trend.get('ma60'))} | {self._format_bias(trend.get('bias_ma60'))} |
+| MA120 | {self._fmt_num(trend.get('ma120'))} | {self._format_bias(trend.get('bias_ma120'))} |
+| MA250 | {self._fmt_num(trend.get('ma250'))} | {self._format_bias(trend.get('bias_ma250'))} |
+
+#### 斐波那契回撤（基于近期主升浪，窗口120日）
+- **上涨段**: 起点 {self._fmt_num(trend.get('fib_trough'))}（{trend.get('fib_trough_date') or 'N/A'}）→ 顶点 {self._fmt_num(trend.get('fib_peak'))}（{trend.get('fib_peak_date') or 'N/A'}）
+- **当前位置**: **{trend.get('fib_current_position') or 'N/A'}**
+
+| 回撤比例 | 价格 | 决策含义 |
+|----------|------|----------|
+| 0.236 | {self._fmt_num(trend.get('fib_0236'))} | 浅回调买点 |
+| 0.382 | {self._fmt_num(trend.get('fib_0382'))} | 常规回调买点 |
+| **0.500** | **{self._fmt_num(trend.get('fib_0500'))}** | **中期回调关键支撑** |
+| 0.618 | {self._fmt_num(trend.get('fib_0618'))} | 深度回调支撑 |
+| 0.786 | {self._fmt_num(trend.get('fib_0786'))} | 趋势保留最后防线 |
+
+#### 历史高低点
+| 周期 | 最高 | 最低 |
+|------|------|------|
+| 60日  | {self._fmt_num(trend.get('high_60d'))} | {self._fmt_num(trend.get('low_60d'))} |
+| 120日 | {self._fmt_num(trend.get('high_120d'))} | {self._fmt_num(trend.get('low_120d'))} |
+| 250日 | {self._fmt_num(trend.get('high_250d'))} | {self._fmt_num(trend.get('low_250d'))} |
+
+#### ATR波动幅度（用于止损距设置）
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| ATR(14) | {self._fmt_num(trend.get('atr_14'))} | 14日真实波幅均值 |
+| ATR占比 | {self._fmt_num(trend.get('atr_pct'))}% | ATR/当前价 |
+| 2×ATR止损距 | {atr_stop_dist} | 建议止损=买入价 - 该数值 |
+
+#### 历史波动率（年化，用于仓位管理）
+| 指标 | 数值 | 波动等级 |
+|------|------|----------|
+| HV(20日) | {self._fmt_num(trend.get('hv_20'))}% | **{trend.get('volatility_level') or 'N/A'}** |
+| HV(60日) | {self._fmt_num(trend.get('hv_60'))}% | 参考：<25%低 / 25-40%中 / 40-60%高 / >60%极高 |
+"""
+
         # 关联商品行情（资源类股票增强，非资源股自动跳过）
         commodity_ctx = context.get("commodity_context")
         if isinstance(commodity_ctx, dict) and commodity_ctx.get("related_commodities"):
@@ -1922,6 +1985,36 @@ class GeminiAnalyzer:
             return f"{float(value):.2f}%"
         except (TypeError, ValueError):
             return 'N/A'
+
+    @staticmethod
+    def _fmt_num(value: Any, digits: int = 2) -> str:
+        """安全数值格式化：None/0/NaN/非数字统一输出 N/A"""
+        if value is None:
+            return 'N/A'
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return 'N/A'
+        if f != f:  # NaN
+            return 'N/A'
+        if f == 0:
+            return 'N/A'
+        return f"{f:.{digits}f}"
+
+    @staticmethod
+    def _format_bias(value: Any) -> str:
+        """格式化乖离率：带符号百分比 + 上/下方语义；0/N/A 统一回退"""
+        if value is None:
+            return 'N/A'
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return 'N/A'
+        if f != f or f == 0:
+            return 'N/A'
+        if f > 0:
+            return f"上方 +{f:.2f}%"
+        return f"下方 {f:.2f}%"
 
     def _format_price(self, value: Optional[float]) -> str:
         """格式化价格显示"""

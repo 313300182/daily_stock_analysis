@@ -359,7 +359,7 @@ class StockAnalysisPipeline:
             try:
                 _mkt = get_market_for_stock(normalize_stock_code(code))
                 end_date = get_market_now(_mkt).date()
-                start_date = end_date - timedelta(days=89)  # ~60 trading days for MA60
+                start_date = end_date - timedelta(days=365)  # ~250 trading days for MA250 / Fibonacci 120d
                 historical_bars = self.db.get_data_range(code, start_date, end_date)
                 historical_bar_count = len(historical_bars) if historical_bars else 0
                 if historical_bars:
@@ -605,7 +605,7 @@ class StockAnalysisPipeline:
             try:
                 _mkt = get_market_for_stock(normalize_stock_code(code))
                 end_date = get_market_now(_mkt).date()
-                start_date = end_date - timedelta(days=89)
+                start_date = end_date - timedelta(days=365)  # ~250 trading days for MA250 / Fibonacci 120d
                 historical_bars = self.db.get_data_range(code, start_date, end_date)
                 historical_bar_count = len(historical_bars) if historical_bars else 0
                 if historical_bars:
@@ -820,6 +820,36 @@ class StockAnalysisPipeline:
                 'signal_reasons': trend_result.signal_reasons,
                 'risk_factors': trend_result.risk_factors,
                 'neutral_observations': getattr(trend_result, 'neutral_observations', []),
+                # === Step 2: 技术锚点增强字段（能取到就带出，取不到保持默认 0/""） ===
+                'ma30': getattr(trend_result, 'ma30', 0.0),
+                'ma60': getattr(trend_result, 'ma60', 0.0),
+                'ma120': getattr(trend_result, 'ma120', 0.0),
+                'ma250': getattr(trend_result, 'ma250', 0.0),
+                'bias_ma30': getattr(trend_result, 'bias_ma30', 0.0),
+                'bias_ma60': getattr(trend_result, 'bias_ma60', 0.0),
+                'bias_ma120': getattr(trend_result, 'bias_ma120', 0.0),
+                'bias_ma250': getattr(trend_result, 'bias_ma250', 0.0),
+                'fib_peak': getattr(trend_result, 'fib_peak', 0.0),
+                'fib_peak_date': getattr(trend_result, 'fib_peak_date', ''),
+                'fib_trough': getattr(trend_result, 'fib_trough', 0.0),
+                'fib_trough_date': getattr(trend_result, 'fib_trough_date', ''),
+                'fib_0236': getattr(trend_result, 'fib_0236', 0.0),
+                'fib_0382': getattr(trend_result, 'fib_0382', 0.0),
+                'fib_0500': getattr(trend_result, 'fib_0500', 0.0),
+                'fib_0618': getattr(trend_result, 'fib_0618', 0.0),
+                'fib_0786': getattr(trend_result, 'fib_0786', 0.0),
+                'fib_current_position': getattr(trend_result, 'fib_current_position', ''),
+                'high_60d': getattr(trend_result, 'high_60d', 0.0),
+                'low_60d': getattr(trend_result, 'low_60d', 0.0),
+                'high_120d': getattr(trend_result, 'high_120d', 0.0),
+                'low_120d': getattr(trend_result, 'low_120d', 0.0),
+                'high_250d': getattr(trend_result, 'high_250d', 0.0),
+                'low_250d': getattr(trend_result, 'low_250d', 0.0),
+                'atr_14': getattr(trend_result, 'atr_14', 0.0),
+                'atr_pct': getattr(trend_result, 'atr_pct', 0.0),
+                'hv_20': getattr(trend_result, 'hv_20', 0.0),
+                'hv_60': getattr(trend_result, 'hv_60', 0.0),
+                'volatility_level': getattr(trend_result, 'volatility_level', ''),
             }
 
         # Issue #234: Override today with realtime OHLC + trend MA for intraday analysis
